@@ -1,0 +1,753 @@
+function step04_setsvd_allch_plus_boosted(rootDir, cleanSubdir, indexSubdir, outSubdir, varargin)
+% STEP 04+ (BOOSTED) — All-channel SET→SVD + Welch + DWT + Entropy
+% + Connectivity (corr/cov, coherence) + Spatial Dynamics + GFP
+%
+% Output: <root>/<outSubdir>/<patientID>_setsvd_W4s_boosted.mat with:
+%   X [N x D], Y [N x 1 uint8], meta table,
+%   params struct (incl. featNames, group info),
+%   featNames [D x 1 string], featGroups [D x 1 uint8], groupNames {cellstr}
+%
+% USAGE (dataset root as rootDir):
+%   root = "C:\...\chb-mit-scalp-eeg-database-1.0.0";
+%   step04_setsvd_allch_plus_boosted(root, ...
+%       "modified_fileswork", ...
+%       "4s_window_V2", ...
+%       "SET_SVD_W4s_allch_plus\Boosted_Feature_Extraction", ...
+%       'UseParallel', true, 'Patients', "chb01");
+%
+% Safe defaults: writes to a NEW subfolder and uses *_boosted filenames.
+
+p = inputParser;
+addParameter(p,'Patients', string.empty);
+addParameter(p,'UseParallel', true, @islogical);
+
+% SET→SVD core
+addParameter(p,'Tbins', 64, @(x)isnumeric(x)&&isscalar(x)&&x>=4);
+addParameter(p,'k', 16, @(x)isnumeric(x)&&isscalar(x)&&x>=1);
+addParameter(p,'EmbDim', 30, @(x)isnumeric(x)&&isscalar(x)&&x>=2);
+addParameter(p,'Delay', 1, @(x)isnumeric(x)&&isscalar(x)&&x>=1);
+addParameter(p,'ZScorePerChannel', true, @islogical);
+addParameter(p,'NormalizeSVPerBin', true, @islogical);
+
+% Welch / DWT / Entropy blocks
+addParameter(p,'IncludeWelch', true, @islogical);
+addParameter(p,'WelchBands', [0.5 4; 4 8; 8 13; 13 30; 30 70]);
+addParameter(p,'WelchAgg', ["mean","std","median"]);
+addParameter(p,'WelchSegSec', 1);
+
+addParameter(p,'IncludeDWT', true, @islogical);
+addParameter(p,'DWTWavelet','db4',@(s)isstring(s)||ischar(s));
+addParameter(p,'DWTLevel',5,@(x)isnumeric(x)&&isscalar(x)&&x>=2);
+addParameter(p,'DWTAgg', ["mean","std","median"]);
+
+addParameter(p,'IncludeEntropy',"both"); % "none"|"sampen"|"permen"|"both"
+addParameter(p,'EntropyAgg', ["mean","std","median"]);
+addParameter(p,'SampEn_m',2);
+addParameter(p,'SampEn_rFrac',0.2);
+addParameter(p,'PermEn_m',3);
+addParameter(p,'PermEn_tau',1);
+
+% NEW: Connectivity / Spatial Dynamics
+addParameter(p,'IncludeConn', true, @islogical);
+addParameter(p,'ConnAgg', ["mean","std","median"]);  % for coherence pooling
+addParameter(p,'ConnMaxPairs', 45, @(x)isnumeric(x)&&isscalar(x)&&x>=6); % mscohere speed cap
+addParameter(p,'SpatialTopK', 3, @(x)isnumeric(x)&&isscalar(x)&&x>=1);   % subspace k
+
+addParameter(p,'BatchSize', 1500, @(x)isnumeric(x)&&isscalar(x)&&x>=200);
+addParameter(p,'PrintEvery', 10000, @(x)isnumeric(x)&&isscalar(x)&&x>=100);
+parse(p,varargin{:});
+opt = p.Results;
+
+if nargin < 2 || isempty(cleanSubdir), cleanSubdir = "modified_fileswork"; end
+if nargin < 3 || isempty(indexSubdir), indexSubdir = "4s_window_V2"; end
+if nargin < 4 || isempty(outSubdir)
+    outSubdir = "SET_SVD_W4s_allch_plus\Boosted_Feature_Extraction";
+end
+
+assert(isfolder(rootDir), 'rootDir not found');
+inCleanDir = fullfile(rootDir, cleanSubdir);
+inIdxDir   = fullfile(rootDir, indexSubdir);
+outDir     = fullfile(rootDir, outSubdir);
+if ~isfolder(inCleanDir), error('Clean folder not found: %s', inCleanDir); end
+if ~isfolder(inIdxDir),   error('Index folder not found: %s', inIdxDir); end
+if ~isfolder(outDir),     mkdir(outDir); end
+
+if opt.UseParallel
+    try, ppool = gcp('nocreate'); if isempty(ppool), parpool('local'); end
+    catch, warning('Parallel unavailable; continuing serially.'); opt.UseParallel=false;
+    end
+end
+
+fprintf('=== Step04 BOOSTED ===\n');
+fprintf('SET→SVD: Tbins=%d, k=%d, EmbDim=%d, Delay=%d | Z=%d Norm=%d\n', ...
+    opt.Tbins, opt.k, opt.EmbDim, opt.Delay, opt.ZScorePerChannel, opt.NormalizeSVPerBin);
+fprintf('Welch=%s DWT=%s-L%d Entropy=%s | Conn=%s (pairs<=%d, kSub=%d)\n', ...
+    string(opt.IncludeWelch), string(opt.DWTWavelet), opt.DWTLevel, string(opt.IncludeEntropy), ...
+    string(opt.IncludeConn), opt.ConnMaxPairs, opt.SpatialTopK);
+
+% Try new 30 s pre-ictal/inter-ictal indices first
+IDX = dir(fullfile(inIdxDir, 'chb*_index_W30s_preInt.mat'));
+
+% If none found, fall back to original Step02 index naming
+if isempty(IDX)
+    IDX = dir(fullfile(inIdxDir, 'chb*_index_W*_*H*.mat'));
+end
+
+if isempty(IDX)
+    error('No Step02 index files found in %s', inIdxDir);
+end
+
+
+% Optional patient filter
+if ~isempty(opt.Patients)
+    want = string(opt.Patients(:));
+    keep = false(numel(IDX),1);
+    for i=1:numel(IDX)
+        pid = extractBefore(string(IDX(i).name), '_index_');
+        keep(i)=any(strcmpi(pid,want));
+    end
+    IDX = IDX(keep);
+    if isempty(IDX), error('No index matches Patients=%s', strjoin(want,',')); end
+end
+
+tAll = tic;
+for kFile = 1:numel(IDX)
+    idxFile = fullfile(IDX(kFile).folder, IDX(kFile).name);
+    [~, base] = fileparts(idxFile);
+    patientID = extractBefore(base, '_index_');
+    cleanFile = fullfile(inCleanDir, patientID + "_clean.mat");
+    outFile   = fullfile(outDir,    patientID + "_setsvd_W4s_boosted.mat");
+
+    if ~isfile(cleanFile)
+        warning('[%s] Missing clean file: %s (skip)', patientID, cleanFile); continue;
+    end
+    if isfile(outFile)
+        fprintf('[%s] exists, skipping (delete to regenerate).\n', patientID); continue;
+    end
+
+    try
+        Sidx = load(idxFile, 'frameIndex','params');
+        F = Sidx.frameIndex; assert(~isempty(F),'Empty frameIndex');
+        frameSec = double(Sidx.params.frameSec);
+
+        Lc = load(cleanFile);
+        assert(isfield(Lc,'recs') && ~isempty(Lc.recs),'Clean has no recs');
+        if isfield(Lc,'channels') && ~isempty(Lc.channels)
+            chanNames = string(Lc.channels(:));
+        else
+            C1 = size(Lc.recs(1).data,1); chanNames = "ch"+string(1:C1);
+        end
+        nChan = numel(chanNames);
+
+        % ---------- FEAT NAME SCAFFOLD + GROUPS ----------
+        featNames = strings(0,1);
+        featGroups = [];              % uint8 groups, 1-based
+        groupNames = { ...
+            'svd', 'welch', 'specEntropy', 'dwtEnergy', ...
+            'sampEn', 'permEn', ...
+            'connCorrCov', 'gfp', 'coherence', 'spatialDyn'};
+
+        % 1) SVD names (group 1)
+        for b=1:opt.Tbins
+            for j=1:opt.k
+                featNames(end+1) = sprintf('svd_bin%02d_s%02d', b, j);
+                featGroups(end+1,1) = 1;
+            end
+        end
+
+        % 2) Welch + spectral entropy (groups 2 & 3)
+        bandNames = ["delta","theta","alpha","beta","gamma"];
+        if size(opt.WelchBands,1) ~= numel(bandNames)
+            bandNames = "band"+string(1:size(opt.WelchBands,1));
+        end
+        if opt.IncludeWelch
+            for bi=1:size(opt.WelchBands,1)
+                for a=1:numel(opt.WelchAgg)
+                    featNames(end+1) = "welch_"+bandNames(bi)+"_"+opt.WelchAgg(a);
+                    featGroups(end+1,1) = 2;
+                end
+            end
+            for a=1:numel(opt.WelchAgg)
+                featNames(end+1) = "specEntropy_"+opt.WelchAgg(a);
+                featGroups(end+1,1) = 3;
+            end
+        end
+
+        % 3) DWT energies (group 4)
+        if opt.IncludeDWT
+            lev = opt.DWTLevel; labels = ["A"+lev, "D"+string(lev:-1:1)];
+            for li=1:numel(labels)
+                for a=1:numel(opt.DWTAgg)
+                    featNames(end+1) = "dwt_"+labels(li)+"_energy_"+opt.DWTAgg(a);
+                    featGroups(end+1,1) = 4;
+                end
+            end
+        end
+
+        % 4) Entropy on DWT bands (groups 5/6)
+        doSamp = any(strcmpi(opt.IncludeEntropy,["sampen","both"]));
+        doPerm = any(strcmpi(opt.IncludeEntropy,["permen","both"]));
+        if doSamp || doPerm
+            lev = opt.DWTLevel; labels = ["A"+lev, "D"+string(lev:-1:1)];
+            if doSamp
+                for li=1:numel(labels)
+                    for a=1:numel(opt.EntropyAgg)
+                        featNames(end+1) = "sampEn_"+labels(li)+"_"+opt.EntropyAgg(a);
+                        featGroups(end+1,1) = 5;
+                    end
+                end
+            end
+            if doPerm
+                for li=1:numel(labels)
+                    for a=1:numel(opt.EntropyAgg)
+                        featNames(end+1) = "permEn_"+labels(li)+"_"+opt.EntropyAgg(a);
+                        featGroups(end+1,1) = 6;
+                    end
+                end
+            end
+        end
+
+        % 5) Connectivity: corr/cov summary (6 feats) (group 7)
+        baseConnNames = ["conn_corr_abs_mean","conn_corr_abs_std","conn_corr_abs_max", ...
+                         "cov_eig1","cov_cond","cov_eigTop5_mean"];
+        for i=1:numel(baseConnNames)
+            featNames(end+1) = baseConnNames(i);
+            featGroups(end+1,1) = 7;
+        end
+
+        % 6) GFP (2 feats) (group 8)
+        featNames(end+1) = "gfp_mean";  featGroups(end+1,1) = 8;
+        featNames(end+1) = "gfp_std";   featGroups(end+1,1) = 8;
+
+        % 7) Coherence per band with aggs (group 9)
+        for bi=1:size(opt.WelchBands,1)
+            for a=1:numel(opt.ConnAgg)
+                featNames(end+1) = "coh_"+bandNames(bi)+"_"+opt.ConnAgg(a);
+                featGroups(end+1,1) = 9;
+            end
+        end
+
+        % 8) Spatial dynamics (3 feats) (group 10)
+        featNames(end+1) = "spat_cov_frob_diff";   featGroups(end+1,1) = 10;
+        featNames(end+1) = "spat_corr_frob_diff";  featGroups(end+1,1) = 10;
+        featNames(end+1) = "spat_subspace_deg";    featGroups(end+1,1) = 10;
+
+        featDim = numel(featNames);
+
+        % ---------- OUTPUT MATFILE ----------
+        mf = matfile(outFile, 'Writable', true);
+        mf.X = zeros(0, featDim, 'double');
+        mf.Y = zeros(0, 1, 'uint8');
+        mf.meta_patientID         = cell(0,1);
+        mf.meta_recordName        = cell(0,1);
+        mf.meta_frameStartSec     = zeros(0,1,'double');
+        mf.meta_frameEndSec       = zeros(0,1,'double');
+        mf.meta_frameCenterSec    = zeros(0,1,'double');
+        mf.meta_episodeID         = zeros(0,1,'uint32');
+        mf.meta_time_to_onset_sec = zeros(0,1,'double');
+        mf.meta_y_state           = zeros(0,1,'uint8');
+        mf.featNames  = featNames;
+        mf.featGroups = uint8(featGroups);
+        mf.groupNames = groupNames;
+
+        params = struct( ...
+            'Tbins',opt.Tbins,'k',opt.k,'EmbDim',opt.EmbDim,'Delay',opt.Delay, ...
+            'ZScorePerChannel',opt.ZScorePerChannel,'NormalizeSVPerBin',opt.NormalizeSVPerBin, ...
+            'IncludeWelch',opt.IncludeWelch,'WelchBands',opt.WelchBands,'WelchAgg',opt.WelchAgg,'WelchSegSec',opt.WelchSegSec, ...
+            'IncludeDWT',opt.IncludeDWT,'DWTWavelet',string(opt.DWTWavelet),'DWTLevel',opt.DWTLevel,'DWTAgg',opt.DWTAgg, ...
+            'IncludeEntropy',string(opt.IncludeEntropy),'EntropyAgg',opt.EntropyAgg, ...
+            'SampEn_m',opt.SampEn_m,'SampEn_rFrac',opt.SampEn_rFrac,'PermEn_m',opt.PermEn_m,'PermEn_tau',opt.PermEn_tau, ...
+            'IncludeConn',opt.IncludeConn,'ConnAgg',opt.ConnAgg,'ConnMaxPairs',opt.ConnMaxPairs,'SpatialTopK',opt.SpatialTopK, ...
+            'frameSec',frameSec,'sourceIdx',idxFile,'sourceClean',cleanFile,'generated',datestr(now,'yyyy-mm-dd HH:MM:SS'));
+        mf.params = params;
+
+        % recName -> index
+        recMap = containers.Map('KeyType','char','ValueType','uint32');
+        for r=1:numel(Lc.recs)
+            recMap(char(string(Lc.recs(r).recordName))) = uint32(r);
+        end
+
+        recNames = unique(F.recordName);
+        totalFrames = height(F);
+        nextWriteRow = 0; tLast = tic;
+
+        for rn = reshape(recNames,1,[])
+            rn = rn{1};
+            rowMask = F.recordName==rn;
+            if ~any(rowMask), continue; end
+            if ~isKey(recMap,char(rn)), warning('[%s] %s not in clean.',patientID,rn); continue; end
+
+            rec = Lc.recs(recMap(char(rn)));
+            if ~isfield(rec,'data')||isempty(rec.data), warning('[%s] empty %s',patientID,rn); continue; end
+            x = double(rec.data);
+            Fs = get_scalar_Fs(rec); if ~isfinite(Fs)||Fs<=0, warning('[%s] bad Fs',patientID); continue; end
+
+            Fi = F(rowMask,:); nRows = height(Fi);
+            B = opt.BatchSize;
+
+            for s0=1:B:nRows
+                s1 = min(nRows, s0+B-1); nb = s1-s0+1;
+                iStart = max(1, floor(Fi.frameStartSec(s0:s1)*Fs)+1);
+                iEnd   = min(size(x,2), floor(Fi.frameEndSec(s0:s1)*Fs));
+                bad = iEnd<iStart; if any(bad), iEnd(bad)=iStart(bad); end
+
+                Xb = zeros(nb, featDim);
+                if opt.UseParallel
+                    parfor ii=1:nb
+                        xs = slice_frame(x, iStart(ii), iEnd(ii));
+                        Xb(ii,:) = features_one_window_all_boosted(xs, Fs, opt, featDim);
+                    end
+                else
+                    for ii=1:nb
+                        xs = slice_frame(x, iStart(ii), iEnd(ii));
+                        Xb(ii,:) = features_one_window_all_boosted(xs, Fs, opt, featDim);
+                    end
+                end
+
+                Yb  = uint8(Fi.y_state(s0:s1));
+                pid = cellstr(repmat(string(patientID), nb,1));
+                rnm = cellstr(Fi.recordName(s0:s1));
+                fsS = double(Fi.frameStartSec(s0:s1));
+                feS = double(Fi.frameEndSec(s0:s1));
+                fcS = double(Fi.frameCenterSec(s0:s1));
+                epi = uint32(Fi.episodeID(s0:s1));
+                tto = double(Fi.time_to_onset_sec(s0:s1));
+
+                r0 = nextWriteRow+1; r1 = nextWriteRow+nb;
+                mf.X(r0:r1,1:featDim)            = Xb;
+                mf.Y(r0:r1,1)                    = Yb;
+                mf.meta_patientID(r0:r1,1)       = pid;
+                mf.meta_recordName(r0:r1,1)      = rnm;
+                mf.meta_frameStartSec(r0:r1,1)   = fsS;
+                mf.meta_frameEndSec(r0:r1,1)     = feS;
+                mf.meta_frameCenterSec(r0:r1,1)  = fcS;
+                mf.meta_episodeID(r0:r1,1)       = epi;
+                mf.meta_time_to_onset_sec(r0:r1,1)= tto;
+                mf.meta_y_state(r0:r1,1)         = Yb;
+                nextWriteRow = r1;
+
+                if toc(tLast)>5 && mod(r1, opt.PrintEvery)==0
+                    fprintf('[%s] %d/%d (%.1f%%)\n',patientID,r1,totalFrames,100*r1/totalFrames);
+                    tLast=tic;
+                end
+            end
+        end
+
+        meta = table( ...
+            string(mf.meta_patientID), string(mf.meta_recordName), ...
+            mf.meta_frameStartSec, mf.meta_frameEndSec, mf.meta_frameCenterSec, ...
+            mf.meta_episodeID, mf.meta_time_to_onset_sec, mf.meta_y_state, ...
+            'VariableNames',{'patientID','recordName','frameStartSec','frameEndSec','frameCenterSec','episodeID','time_to_onset_sec','y_state'});
+        save(outFile, 'meta','-append');
+
+        counts = accumarray(double(mf.Y)+1,1,[4 1],@sum,0);
+        fprintf('[%s] DONE: frames=%d | [0..3]=%s | out=%s\n',patientID,size(mf.Y,1),mat2str(counts.'),outFile);
+
+    catch ME
+        warning('[%s] Failed: %s', patientID, ME.message);
+        if isfile(outFile), try, delete(outFile); catch, end, end
+    end
+end
+
+fprintf('All patients done in %.1f min\n', toc(tAll)/60);
+end
+
+% =================== Helpers ===================
+
+function xs = slice_frame(x,iStart,iEnd)
+if isempty(x) || iEnd < iStart
+    xs = nan(size(x,1), 1);
+else
+    xs = x(:, max(1,iStart):max(iStart,iEnd));
+end
+end
+
+function Fs = get_scalar_Fs(rec)
+Fs = NaN;
+if isfield(rec,'Fs') && ~isempty(rec.Fs)
+    F = rec.Fs;
+    if isscalar(F) && isfinite(F) && F > 0
+        Fs = double(F); return;
+    elseif isnumeric(F) && ~isscalar(F)
+        F = double(F(:));
+        F = F(isfinite(F) & F > 0);
+        if ~isempty(F)
+            Fs = mode(round(F)); if isfinite(Fs) && Fs > 0, return; end
+        end
+    end
+end
+try
+    if isfield(rec,'data') && ~isempty(rec.data) && ...
+       isfield(rec,'durationSec') && ~isempty(rec.durationSec) && rec.durationSec > 0
+        Fs = size(rec.data,2) / double(rec.durationSec);
+        Fs = round(Fs); if isfinite(Fs) && Fs > 0, return; end
+    end
+end
+try
+    if isfield(rec,'seizureMask') && ~isempty(rec.seizureMask) && ...
+       isfield(rec,'durationSec') && ~isempty(rec.durationSec) && rec.durationSec > 0
+        Fs = numel(rec.seizureMask) / double(rec.durationSec);
+        Fs = round(Fs); if isfinite(Fs) && Fs > 0, return; end
+    end
+end
+Fs = 256;
+end
+
+function f = features_one_window_all_boosted(x, Fs, opt, featDim)
+pieces = {};
+
+% A) SVD pool (group 1)
+pieces{end+1} = rep_allch_svd_pool(x, opt.Tbins, opt.EmbDim, opt.Delay, opt.k, ...
+                                   opt.ZScorePerChannel, opt.NormalizeSVPerBin);
+
+% B) Welch + SpecEntropy (groups 2 & 3)
+if opt.IncludeWelch
+    pieces{end+1} = welch_block(x, Fs, opt.WelchBands, opt.WelchSegSec, opt.WelchAgg);
+    pieces{end+1} = spec_entropy_block(x, Fs, opt.WelchSegSec, opt.WelchAgg);
+end
+
+% C) DWT energy (group 4)
+if opt.IncludeDWT
+    pieces{end+1} = dwt_energy_block(x, string(opt.DWTWavelet), opt.DWTLevel, opt.DWTAgg);
+end
+
+% D) Entropy on DWT bands (groups 5/6)
+if any(strcmpi(opt.IncludeEntropy,["sampen","permen","both"]))
+    pieces{end+1} = dwt_entropy_block( ...
+        x, string(opt.DWTWavelet), opt.DWTLevel, ...
+        any(strcmpi(opt.IncludeEntropy,["sampen","both"])), opt.SampEn_m, opt.SampEn_rFrac, ...
+        any(strcmpi(opt.IncludeEntropy,["permen","both"])), opt.PermEn_m, opt.PermEn_tau, ...
+        opt.EntropyAgg);
+end
+
+% E) Connectivity & Spatial Dynamics (groups 7..10)
+if isfield(opt,'IncludeConn') && opt.IncludeConn
+    pieces{end+1} = conn_corr_cov_block(x);                              % 6
+    pieces{end+1} = gfp_block(x);                                        % 2
+    pieces{end+1} = coherence_block_fast(x, Fs, opt.WelchBands, opt.ConnAgg, opt.ConnMaxPairs); % nb*|agg|
+    pieces{end+1} = spatial_dynamics_block(x, opt.SpatialTopK);          % 3
+end
+
+f = cat(2, pieces{:});
+% guard against length drift
+if numel(f) ~= featDim
+    if numel(f) < featDim, f = [f, zeros(1, featDim - numel(f))];
+    else,                  f = f(1:featDim);
+    end
+end
+end
+
+function feat = rep_allch_svd_pool(x, Tbins, embDim, delay, k, zscoreEach, normSV)
+[nChan, nSamp] = size(x);
+if nSamp <= 1 || nChan == 0 || ~any(isfinite(x(:)))
+    feat = zeros(1, k*Tbins); return;
+end
+if zscoreEach
+    mu = mean(x,2,'omitnan');
+    sd = std(x,0,2,'omitnan'); sd(sd<1e-8) = 1e-8;
+    x = (x - mu) ./ sd;
+end
+edges = round(linspace(1, nSamp+1, Tbins+1));
+out = zeros(k, Tbins);
+reqLen = embDim + (embDim-1)*delay;
+
+for b = 1:Tbins
+    i0 = edges(b); i1 = edges(b+1)-1;
+    xb = x(:, i0:i1); L  = size(xb,2);
+    if L >= reqLen
+        nCols = L - (embDim-1)*delay;
+        baseIdx = (0:(nCols-1));
+        Xcat = zeros(nChan*embDim, nCols);
+        for c = 1:nChan
+            rows = zeros(embDim, nCols);
+            for r = 1:embDim
+                rows(r,:) = xb(c, (r-1)*delay + 1 + baseIdx);
+            end
+            Xcat((c-1)*embDim + (1:embDim), :) = rows;
+        end
+    else
+        Xcat = xb;
+    end
+    if isempty(Xcat) || ~any(isfinite(Xcat(:)))
+        s = zeros(k,1);
+    else
+        [nr, nc] = size(Xcat);
+        if nr >= nc
+            [~, S, ~] = svd(Xcat, 'econ'); svals = diag(S);
+        else
+            C = Xcat * Xcat'; C(~isfinite(C)) = 0;
+            ev = eig((C + C')/2); svals = sort(sqrt(max(ev,0)), 'descend');
+        end
+        s = zeros(k,1);
+        if ~isempty(svals), s(1:min(k,numel(svals))) = svals(1:min(k,numel(svals))); end
+        if normSV, s = s / max(1e-8, sum(s)); end
+    end
+    out(:,b) = s;
+end
+feat = reshape(out, 1, []);
+end
+
+function f = welch_block(x, Fs, bands, segSec, aggs)
+[nChan, ~] = size(x);
+segLen = max(32, round(segSec*Fs));
+nfft   = max(256, 2^nextpow2(segLen));
+ovlp   = round(0.5*segLen);
+nb     = size(bands,1);
+
+pw = nan(nChan, nb);
+for c = 1:nChan
+    xc = x(c,:);
+    if any(~isfinite(xc)), xc = fillmissing(xc,'linear','EndValues','nearest'); end
+    try
+        [Pxx,F] = pwelch(xc, hamming(segLen), ovlp, nfft, Fs);
+        for b = 1:nb
+            pw(c,b) = bandpower(Pxx, F, bands(b,:));
+        end
+    catch
+        pw(c,:) = nan(1,nb);
+    end
+end
+f = aggregate_matrix(pw, aggs);
+end
+
+function f = spec_entropy_block(x, Fs, segSec, aggs)
+[nChan, ~] = size(x);
+segLen = max(32, round(segSec*Fs));
+nfft   = max(256, 2^nextpow2(segLen));
+ovlp   = round(0.5*segLen);
+
+se = nan(nChan,1);
+for c = 1:nChan
+    xc = x(c,:);
+    if any(~isfinite(xc)), xc = fillmissing(xc,'linear','EndValues','nearest'); end
+    try
+        [Pxx,~] = pwelch(xc, hamming(segLen), ovlp, nfft, Fs);
+        P = Pxx(:); P = P / max(1e-12, sum(P));
+        se(c) = -sum(P .* log(P + 1e-12));
+    catch
+        se(c) = nan;
+    end
+end
+f = aggregate_vector(se, aggs);
+end
+
+function f = dwt_energy_block(x, wname, wlevel, aggs)
+[nChan, ~] = size(x);
+levs = ["A"+wlevel, "D"+string(wlevel:-1:1)];
+E = nan(nChan, numel(levs));
+for c = 1:nChan
+    xc = x(c,:);
+    if any(~isfinite(xc)), xc = fillmissing(xc,'linear','EndValues','nearest'); end
+    try
+        [C,L] = wavedec(xc, wlevel, wname);
+        a  = appcoef(C,L,wname,wlevel);
+        ds = cell(1,wlevel);
+        for j = 1:wlevel, ds{j} = detcoef(C,L,j); end
+        Es = [sum(a.^2), cellfun(@(v)sum(v.^2), ds(end:-1:1))];
+        E(c,:) = Es;
+    catch
+        E(c,:) = nan;
+    end
+end
+f = aggregate_matrix(E, aggs);
+end
+
+function f = dwt_entropy_block(x, wname, wlevel, doSamp, mSamp, rFrac, doPerm, mPerm, tau, aggs)
+[nChan, ~] = size(x);
+levs = ["A"+wlevel, "D"+string(wlevel:-1:1)];
+K = numel(levs);
+colsPerBand = double(doSamp) + double(doPerm);
+E = nan(nChan, K * max(1, colsPerBand));
+
+for c = 1:nChan
+    xc = x(c,:);
+    if any(~isfinite(xc)), xc = fillmissing(xc,'linear','EndValues','nearest'); end
+    try
+        [C,L] = wavedec(xc, wlevel, wname);
+        parts = cell(1,K);
+        parts{1} = appcoef(C,L,wname,wlevel);
+        for j = 1:wlevel, parts{j+1} = detcoef(C,L,j); end
+        parts = parts([1, (2:K)]);  % A, then D_wlevel..D1
+
+        row = [];
+        for k = 1:K
+            sig = parts{k}; sig = sig(~isnan(sig));
+            if isempty(sig)
+                se = nan; pe = nan;
+            else
+                if doSamp
+                    r = rFrac * std(sig);
+                    se = sampEn(sig, mSamp, r);
+                else
+                    se = [];
+                end
+                if doPerm
+                    pe = permEn(sig, mPerm, tau);
+                else
+                    pe = [];
+                end
+            end
+            row = [row, se, pe]; %#ok<AGROW>
+        end
+        E(c,1:numel(row)) = row;
+    catch
+        % leave NaNs
+    end
+end
+f = aggregate_matrix(E, aggs);
+end
+
+function f = conn_corr_cov_block(x)
+[nChan, nSamp] = size(x); %#ok<ASGLU>
+if nChan<2 || nSamp<8 || ~any(isfinite(x(:)))
+    f = zeros(1,6); return;
+end
+R = corrcoef(x','Rows','pairwise');   % channels × channels
+R(1:size(R,1)+1:end) = NaN;
+rvec = abs(R(~isnan(R)));
+c_mean = mean(rvec,'omitnan');
+c_std  = std(rvec,0,'omitnan');
+c_max  = max(rvec,[],'omitnan');
+
+X = x.'; X = X - mean(X,1,'omitnan');
+Sigma = (X.'*X) / max(1,(size(X,1)-1));
+Sigma(~isfinite(Sigma)) = 0;
+ev = sort(real(eig((Sigma+Sigma')/2)), 'descend');
+eig1 = ev(1);
+condS = cond(Sigma + 1e-6*eye(size(Sigma)));
+top5 = mean(ev(1:min(5,end)));
+
+f = [c_mean, c_std, c_max, eig1, condS, top5];
+end
+
+function f = gfp_block(x)
+if isempty(x) || size(x,1)<2, f = [0 0]; return; end
+g = std(x,0,1,'omitnan');
+f = [mean(g,'omitnan'), std(g,0,2,'omitnan')];
+end
+
+function f = coherence_block_fast(x, Fs, bands, aggs, maxPairs)
+[nChan, ~] = size(x);
+nb = size(bands,1);
+if nChan<2, f = zeros(1, nb*numel(aggs)); return; end
+
+pairs = nchoosek(1:nChan,2);
+if size(pairs,1) > maxPairs
+    idx = randperm(size(pairs,1), maxPairs);
+    pairs = pairs(idx,:);
+end
+
+cb = nan(size(pairs,1), nb);
+segLen = max(32, round(1*Fs));
+nfft   = max(256, 2^nextpow2(segLen));
+ovlp   = round(0.5*segLen);
+
+for p = 1:size(pairs,1)
+    a = x(pairs(p,1),:); b = x(pairs(p,2),:);
+    if any(~isfinite(a)), a = fillmissing(a,'linear','EndValues','nearest'); end
+    if any(~isfinite(b)), b = fillmissing(b,'linear','EndValues','nearest'); end
+    try
+        [Cxy,F] = mscohere(a,b,hamming(segLen), ovlp, nfft, Fs);
+        for bi=1:nb
+            fr = bands(bi,:);
+            m = (F>=fr(1) & F<fr(2));
+            cb(p,bi) = mean(Cxy(m),'omitnan');
+        end
+    catch
+        % leave NaN row
+    end
+end
+
+f = aggregate_matrix(cb, aggs);
+end
+
+function f = spatial_dynamics_block(x, kTop)
+[nChan, nSamp] = size(x);
+if nChan<2 || nSamp<16, f = [0 0 0]; return; end
+mid = floor(nSamp/2);
+A = x(:,1:mid); B = x(:,mid+1:end);
+A = A - mean(A,2,'omitnan'); B = B - mean(B,2,'omitnan');
+
+Sa = cov(A.', 'partialrows');  Sb = cov(B.', 'partialrows');
+Sa(~isfinite(Sa))=0;  Sb(~isfinite(Sb))=0;
+
+Ra = corrcoef(A','Rows','pairwise'); Rb = corrcoef(B','Rows','pairwise');
+Ra(~isfinite(Ra))=0; Rb(~isfinite(Rb))=0;
+
+covDiff  = norm(Sa - Sb, 'fro');
+corrDiff = norm(Ra - Rb, 'fro');
+
+[Ua,~,~] = svd((Sa+Sa')/2, 'econ');
+[Ub,~,~] = svd((Sb+Sb')/2, 'econ');
+k = min([kTop, size(Ua,2), size(Ub,2), 5]);
+theta = subspace(Ua(:,1:k), Ub(:,1:k)) * (180/pi);
+
+f = [covDiff, corrDiff, theta];
+end
+
+function f = aggregate_matrix(M, aggs)
+K = size(M,2);
+f = [];
+for a = 1:numel(aggs)
+    switch lower(aggs(a))
+        case 'mean',   v = mean(M,1,'omitnan');
+        case 'std',    v = std(M,0,1,'omitnan');
+        case 'median', v = median(M,1,'omitnan');
+        otherwise, error('Unknown agg: %s', aggs(a));
+    end
+    f = [f, v]; %#ok<AGROW>
+end
+end
+
+function f = aggregate_vector(v, aggs)
+f = [];
+for a = 1:numel(aggs)
+    switch lower(aggs(a))
+        case 'mean',   f = [f, mean(v,'omitnan')];
+        case 'std',    f = [f, std(v,0,'omitnan')];
+        case 'median', f = [f, median(v,'omitnan')];
+        otherwise, error('Unknown agg: %s', aggs(a));
+    end
+end
+end
+
+function se = sampEn(x, m, r)
+x = x(:)'; N = numel(x);
+if N < m+2, se = NaN; return; end
+sd = std(x); if sd < 1e-12, se = 0; return; end
+r = max(r, 1e-12);
+Xm  = zeros(N-m+1, m);
+Xm1 = zeros(N-m,   m+1);
+for i = 1:m,   Xm(:,i)  = x(i:i+N-m);   end
+for i = 1:m+1, Xm1(:,i) = x(i:i+N-m-1); end
+Cm = 0;
+for i = 1:size(Xm,1)-1
+    d  = max(abs(Xm(i+1:end,:) - Xm(i,:)), [], 2);
+    Cm = Cm + sum(d <= r);
+end
+Cm1 = 0;
+for i = 1:size(Xm1,1)-1
+    d   = max(abs(Xm1(i+1:end,:) - Xm1(i,:)), [], 2);
+    Cm1 = Cm1 + sum(d <= r);
+end
+if Cm == 0 || Cm1 == 0, se = Inf; else, se = -log((Cm1 / (N-m-1)) / (Cm / (N-m))); end
+end
+
+function pe = permEn(x, m, tau)
+x = x(:)'; N = numel(x); L = N - (m-1)*tau;
+if L <= 0, pe = NaN; return; end
+Y = zeros(L, m);
+for i = 1:m, Y(:,i) = x((1:L) + (i-1)*tau); end
+[~, ord] = sort(Y, 2);
+permsAll = perms(1:m);
+idx = zeros(L,1);
+for i = 1:L
+    pat = ord(i,:);
+    for j = 1:size(permsAll,1)
+        if all(pat == permsAll(j,:)), idx(i) = j; break; end
+    end
+end
+p = accumarray(idx(idx>0), 1, [size(permsAll,1),1]);
+p = p / max(1,sum(p));
+pe = -sum(p .* log(p + 1e-12));
+end
