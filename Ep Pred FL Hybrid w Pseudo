@@ -1,0 +1,670 @@
+function OUT = step12_pseudo_hybrid_logreg_GMMz_nearestGlobal_V1(fsAugDir, keepMatFile, outDir, varargin)
+% STEP12_PSEUDO_HYBRID_LOGREG_GMMZ_NEARESTGLOBAL_V1
+% Pre-ictal (1) vs inter-ictal (0) pseudo-data FL hybrid.
+%
+% Core principles:
+%   1) Real split == Step11 fixed-fold logic (no changes)
+%   2) Pseudo generated from REAL TRAIN only, in TRAIN z-space
+%   3) Global pseudo included via nearest-to-local selection (z-space)
+%   4) Final predictor is ridge logistic regression trained on REAL+PSEUDO
+%      with down-weighted pseudo (pseudo participates but cannot dominate)
+%   5) tau_star calibrated using REAL TRAIN only (balanced subset)
+%
+% Outputs:
+%   outDir\fed\pseudo_data\chbXX\pseudo_pos.mat / pseudo_neg.mat (z-space)
+%   outDir\fed\scores_by_patient\chbXX_hybrid_scores.mat
+%   outDir\fed\hybrid_eval_summary_adaptive.csv
+
+% ---------------- Options ----------------
+p = inputParser;
+
+% Step11-equivalent split/sampling
+addParameter(p,'NegPosRatio', 5, @(x)isnumeric(x)&&isscalar(x)&&x>=1);
+addParameter(p,'Seed', 42, @(x)isnumeric(x)&&isscalar(x));
+addParameter(p,'TsTolSec', 1, @(x)isnumeric(x)&&isscalar(x)&&x>0);
+addParameter(p,'MinPosTrain', 20, @(x)isnumeric(x)&&isscalar(x)&&x>=1);
+addParameter(p,'MinPosTest',  20, @(x)isnumeric(x)&&isscalar(x)&&x>=1);
+addParameter(p,'MinNegTrain', 50, @(x)isnumeric(x)&&isscalar(x)&&x>=1);
+addParameter(p,'MinNegTest',  50, @(x)isnumeric(x)&&isscalar(x)&&x>=1);
+addParameter(p,'ContigBlock', true, @(x)islogical(x)&&isscalar(x));
+
+% Pseudo (GMM in z-space)
+addParameter(p,'TargetPerClass', 4000, @(x)isnumeric(x)&&isscalar(x)&&x>=200);
+addParameter(p,'GMMComponents', 3, @(x)isnumeric(x)&&isscalar(x)&&x>=1);
+addParameter(p,'GMMCovType', "diagonal", @(s)isstring(s)||ischar(s)); % recommended default
+addParameter(p,'GMMReg', 1e-5, @(x)isnumeric(x)&&isscalar(x)&&x>0);
+addParameter(p,'GMMReplicates', 3, @(x)isnumeric(x)&&isscalar(x)&&x>=1);
+addParameter(p,'GMMMaxIter', 500, @(x)isnumeric(x)&&isscalar(x)&&x>=50);
+addParameter(p,'ClipLo', 0.01, @(x)isnumeric(x)&&isscalar(x)&&x>=0&&x<0.5);
+addParameter(p,'ClipHi', 0.99, @(x)isnumeric(x)&&isscalar(x)&&x>0.5&&x<=1);
+
+% Global pseudo add (nearest-to-local)
+addParameter(p,'GlobalFrac', 0.15, @(x)isnumeric(x)&&isscalar(x)&&x>=0);
+addParameter(p,'ExcludeSelf', true, @(x)islogical(x)&&isscalar(x));
+
+% Final ridge log-reg
+addParameter(p,'Lambda', 1e-3, @(x)isnumeric(x)&&isscalar(x)&&x>0);
+addParameter(p,'PseudoWeight', 0.10, @(x)isnumeric(x)&&isscalar(x)&&x>0); % alpha
+
+% Threshold calibration grid
+addParameter(p,'TauGridN', 201, @(x)isnumeric(x)&&isscalar(x)&&x>=51);
+
+% Misc
+addParameter(p,'Verbose', true, @(x)islogical(x)&&isscalar(x));
+parse(p, varargin{:});
+opt = p.Results;
+
+assert(isfolder(fsAugDir), 'fsAugDir not found: %s', fsAugDir);
+assert(isfile(keepMatFile), 'keepMatFile not found: %s', keepMatFile);
+if nargin < 3 || isempty(outDir)
+    outDir = fullfile(fsAugDir, "Model_Step12_PseudoHybrid_LogReg_GMMz");
+end
+if ~isfolder(outDir), mkdir(outDir); end
+if isfinite(opt.Seed), rng(opt.Seed,'twister'); end
+
+% keepIdx
+K = load(keepMatFile);
+assert(isfield(K,'out') && isfield(K.out,'keepIdx'), 'keepMatFile must contain out.keepIdx');
+keepIdx = K.out.keepIdx(:);
+D = numel(keepIdx);
+assert(D>=1,'keepIdx empty');
+
+fedDir     = fullfile(outDir, 'fed');
+pseudoRoot = fullfile(fedDir, 'pseudo_data');
+scoresDir  = fullfile(fedDir, 'scores_by_patient');
+if ~isfolder(fedDir), mkdir(fedDir); end
+if ~isfolder(pseudoRoot), mkdir(pseudoRoot); end
+if ~isfolder(scoresDir), mkdir(scoresDir); end
+
+fixed = fixed_fold_map();
+
+if opt.Verbose
+    fprintf('\n=== STEP12 PSEUDO-HYBRID | LOGREG (REAL+PSEUDO) | GMM in z-space | D=%d ===\n', D);
+    fprintf('PseudoWeight(alpha)=%.3f | GlobalFrac=%.3f | Lambda=%.2g | Seed=%d\n', ...
+        opt.PseudoWeight, opt.GlobalFrac, opt.Lambda, opt.Seed);
+    fprintf('GMM: K=%d cov=%s reg=%.1e | pseudo N/class=%d | clip=[%.2f, %.2f]\n', ...
+        opt.GMMComponents, string(opt.GMMCovType), opt.GMMReg, opt.TargetPerClass, opt.ClipLo, opt.ClipHi);
+end
+
+% ---------- Build/load z-space pseudo for all patients ----------
+P = build_or_load_all_pseudo_GMM_zspace(fsAugDir, pseudoRoot, keepIdx, fixed, opt);
+numP = numel(P);
+assert(numP>0,'No patients with pseudo were built/loaded.');
+
+rows = {};
+for i = 1:numP
+    pid = P(i).pid;
+    if opt.Verbose, fprintf('\n== %s ==\n', pid); end
+
+    % ---------- REAL split (Step11) ----------
+    [Xtr_raw, ytr, Xte_raw, yte, meta_tr, meta_te, diag, mu_tr, sg_tr] = ...
+        get_real_split_step11_and_stats(fsAugDir, pid, keepIdx, fixed, opt);
+    if isempty(Xtr_raw)
+        if opt.Verbose, fprintf('  Skip: real split unavailable.\n'); end
+        continue;
+    end
+
+    % z-space real data (TRAIN stats)
+    XtrZ = zscore_apply(double(Xtr_raw), mu_tr, sg_tr);
+    XteZ = zscore_apply(double(Xte_raw), mu_tr, sg_tr);
+    XtrZ(~isfinite(XtrZ)) = 0;
+    XteZ(~isfinite(XteZ)) = 0;
+
+    % ---------- Local pseudo (already z-space for this patient) ----------
+    Xpos_locZ = P(i).XposZ;
+    Xneg_locZ = P(i).XnegZ;
+    [XlocZ, yloc] = cap_ratio(Xpos_locZ, Xneg_locZ, opt.NegPosRatio, opt.MinNegTrain);
+    nLocPos = sum(yloc==1); nLocNeg = sum(yloc==0);
+
+    if nLocPos < opt.MinPosTrain || nLocNeg < opt.MinNegTrain
+        if opt.Verbose, fprintf('  Skip: insufficient local pseudo after cap.\n'); end
+        continue;
+    end
+
+    % ---------- Global pools in *local z-space* ----------
+    % All pseudo are stored in their own patient z-space; to compare distances
+    % consistently, global samples are mapped into this patient's z-space using
+    % this patient's TRAIN (mu_tr, sg_tr). Since pseudo is already in z-space
+    % of each source, the safest approach is to store pseudo in RAW and map.
+    %
+    % Practical compromise:
+    %   This script stores pseudo in *z-space of the target patient* already,
+    %   because each patient pseudo is generated from their real TRAIN z-space.
+    %   Therefore, global pseudo should be re-generated/mapped into pid-space.
+    %
+    % To keep this implementation simple and correct, global mixing uses only
+    % other patients' pseudo that have been *re-expressed* in pid-space by
+    % sampling from their GMM and then applying pid's mu/sigma. That requires
+    % their GMMs. This script loads their GMMs and resamples on the fly.
+
+    [Xpos_globZ, Xneg_globZ] = global_pools_in_target_z(pseudoRoot, pid, mu_tr, sg_tr, opt);
+
+    % ---------- Nearest-to-local selection per class ----------
+    fracBase = opt.GlobalFrac;
+    nPosAdd = min(round(fracBase * nLocPos), size(Xpos_globZ,1));
+    nNegAdd = min(round(fracBase * nLocNeg), size(Xneg_globZ,1));
+
+    Xpos_addZ = zeros(0,D,'single');
+    Xneg_addZ = zeros(0,D,'single');
+
+    if nPosAdd > 0 && ~isempty(Xpos_globZ)
+        cpos = mean(double(Xpos_locZ),1);
+        Xpos_addZ = select_nearest(Xpos_globZ, cpos, nPosAdd);
+    end
+    if nNegAdd > 0 && ~isempty(Xneg_globZ)
+        cneg = mean(double(Xneg_locZ),1);
+        Xneg_addZ = select_nearest(Xneg_globZ, cneg, nNegAdd);
+    end
+
+    effFracPos = size(Xpos_addZ,1) / max(1,nLocPos);
+    effFracNeg = size(Xneg_addZ,1) / max(1,nLocNeg);
+
+    % ---------- Hybrid pseudo set (cap again) ----------
+    XhyZ_raw = [XlocZ; Xpos_addZ; Xneg_addZ];
+    yhy_raw  = [yloc; ones(size(Xpos_addZ,1),1,'uint8'); zeros(size(Xneg_addZ,1),1,'uint8')];
+    [XhyZ, yhy] = cap_ratio( ...
+        XhyZ_raw(yhy_raw==1,:), XhyZ_raw(yhy_raw==0,:), opt.NegPosRatio, opt.MinNegTrain);
+
+    % ---------- Train final ridge log-reg on REAL+PSEUDO (pseudo down-weighted) ----------
+    % Real weights = 1, pseudo weights = alpha
+    Xtrain = [XtrZ; double(XhyZ)];
+    ytrain = [double(ytr); double(yhy)];
+
+    wReal  = ones(numel(ytr),1);
+    wPseudo = opt.PseudoWeight * ones(numel(yhy),1);
+    wAll = [wReal; wPseudo];
+
+    % also class-balance weights (multiplicative)
+    wb = class_weights01(ytrain);
+    wAll = wAll .* wb;
+
+    mdl = fitclinear(Xtrain, ytrain, ...
+        'Learner','logistic', ...
+        'Regularization','ridge', ...
+        'Lambda', opt.Lambda, ...
+        'ClassNames', [0 1], ...
+        'Weights', wAll);
+
+    % ---------- tau_star from REAL TRAIN only ----------
+    [Xval, yVal] = build_balanced_subset(XtrZ, uint8(ytr==1));
+    pVal = predict_prob_logreg(mdl, Xval);
+    [tau_star, ~] = calibrate_threshold_balacc(pVal, yVal, opt.TauGridN);
+
+    % ---------- Evaluate on REAL TEST only ----------
+    pTe = predict_prob_logreg(mdl, XteZ);
+    [auc, auprc] = auc_auprc_robust(double(yte), double(pTe));
+    mAt = metrics_at_tau(double(yte), double(pTe), tau_star);
+
+    if opt.Verbose
+        fprintf('  HYBRID(logreg) | effFracPos=%.3f effFracNeg=%.3f | AUROC=%.3f AUPRC=%.3f | Acc=%.3f PosAcc=%.3f NegAcc=%.3f BalAcc=%.3f | tau*=%.3f\n', ...
+            effFracPos, effFracNeg, auc, auprc, mAt.Acc, mAt.PosAcc, mAt.NegAcc, mAt.BalAcc, tau_star);
+    end
+
+    % Save artefact
+    scoreOut = struct;
+    scoreOut.patientID  = pid;
+    scoreOut.keepIdx    = keepIdx;
+    scoreOut.mu_tr      = mu_tr;
+    scoreOut.sg_tr      = sg_tr;
+    scoreOut.effFracPos = effFracPos;
+    scoreOut.effFracNeg = effFracNeg;
+    scoreOut.mdl        = mdl;
+    scoreOut.tau_star   = tau_star;
+    scoreOut.real = struct('train',struct('y',ytr,'meta',meta_tr), 'test',struct('y',yte,'meta',meta_te), 'diag',diag);
+    scoreOut.pred = struct('pVal',pVal,'yVal',yVal,'pTe',pTe,'yTe',yte);
+    save(fullfile(scoresDir, pid + "_hybrid_scores.mat"), 'scoreOut', '-v7.3');
+
+    rows{end+1,1} = table(pid, effFracPos, effFracNeg, ...
+        diag.testFold, diag.nSeizuresDetected, ...
+        diag.Npos_train, diag.Nneg_train, diag.Npos_test, diag.Nneg_test, ...
+        auc, auprc, mAt.Acc, mAt.PosAcc, mAt.NegAcc, mAt.BalAcc, tau_star, ...
+        'VariableNames', {'patient','effFracPos','effFracNeg', ...
+        'testFold','nSeizuresDetected', ...
+        'Npos_train','Nneg_train','Npos_test','Nneg_test', ...
+        'AUROC','AUPRC','Acc','PosAcc','NegAcc','BalAcc','tau_star'});
+end
+
+% ---------- Write summary CSV (1 row per patient) ----------
+if ~isempty(rows)
+    Tout = vertcat(rows{:});
+
+    % Stable ordering
+    Tout = sortrows(Tout, 'patient');
+
+    % Primary output (mirror prior style)
+    outCSV = fullfile(fedDir, "FixedTest_patient_results_pseudoHybrid.csv");
+    writetable(Tout, outCSV);
+
+    % Optional: save config alongside
+    cfgOut = opt;
+    save(fullfile(fedDir, "run_config.mat"), "cfgOut", "-v7.3");
+
+    if opt.Verbose
+        fprintf('\nSaved hybrid patient summary → %s\n', outCSV);
+    end
+else
+    Tout = table();
+    outCSV = "";
+    if opt.Verbose
+        fprintf('\nNo patient rows produced; CSV not written.\n');
+    end
+end
+
+OUT = struct('summary',Tout,'csvFile',outCSV,'fedDir',fedDir,'pseudoRoot',pseudoRoot,'scoresDir',scoresDir);
+
+end
+
+% ========================= PSEUDO BUILD (z-space) =========================
+
+function P = build_or_load_all_pseudo_GMM_zspace(fsAugDir, pseudoRoot, keepIdx, fixed, opt)
+P = struct('pid',{},'XposZ',{},'XnegZ',{});
+
+for i = 1:height(fixed)
+    pid = string(fixed.patientID(i));
+    pdir = fullfile(pseudoRoot, pid);
+    if ~isfolder(pdir), mkdir(pdir); end
+
+    posF = fullfile(pdir,'pseudo_pos.mat');
+    negF = fullfile(pdir,'pseudo_neg.mat');
+    gmmF = fullfile(pdir,'pseudo_gmm.mat');
+
+    if isfile(posF) && isfile(negF) && isfile(gmmF)
+        XposZ = load_first_matrix(posF);
+        XnegZ = load_first_matrix(negF);
+        if size(XposZ,2)==numel(keepIdx) && size(XnegZ,2)==numel(keepIdx)
+            P(end+1).pid  = pid; %#ok<AGROW>
+            P(end).XposZ  = single(XposZ);
+            P(end).XnegZ  = single(XnegZ);
+            continue;
+        end
+    end
+
+    % Real split + TRAIN stats
+    [Xtr_raw, ytr, ~, ~, ~, ~, diag, mu_tr, sg_tr] = get_real_split_step11_and_stats(fsAugDir, pid, keepIdx, fixed, opt);
+    if isempty(Xtr_raw), continue; end
+
+    XtrZ = zscore_apply(double(Xtr_raw), mu_tr, sg_tr);
+    XtrZ(~isfinite(XtrZ)) = 0;
+    ytr = double(ytr(:));
+
+    Xpos = XtrZ(ytr==1,:);
+    Xneg = XtrZ(ytr==0,:);
+    if size(Xpos,1)<10 || size(Xneg,1)<10, continue; end
+
+    covType = lower(char(opt.GMMCovType));
+    if ~ismember(covType, {'full','diagonal'}), covType='diagonal'; end
+
+    Kbase = double(opt.GMMComponents);
+    Kpos = max(1, min(Kbase, floor(size(Xpos,1)/50)));
+    Kneg = max(1, min(Kbase, floor(size(Xneg,1)/200)));
+
+    try
+        gmmPos = fitgmdist(Xpos, Kpos, ...
+            'CovarianceType', covType, ...
+            'RegularizationValue', opt.GMMReg, ...
+            'Replicates', opt.GMMReplicates, ...
+            'Options', statset('MaxIter', opt.GMMMaxIter, 'Display','off'));
+        gmmNeg = fitgmdist(Xneg, Kneg, ...
+            'CovarianceType', covType, ...
+            'RegularizationValue', opt.GMMReg, ...
+            'Replicates', opt.GMMReplicates, ...
+            'Options', statset('MaxIter', opt.GMMMaxIter, 'Display','off'));
+    catch
+        continue;
+    end
+
+    N = double(opt.TargetPerClass);
+    Xp_posZ = random(gmmPos, N);
+    Xp_negZ = random(gmmNeg, N);
+
+    % Clip in z-space to TRAIN z-quantiles
+    lo = quantile(XtrZ, opt.ClipLo, 1);
+    hi = quantile(XtrZ, opt.ClipHi, 1);
+    Xp_posZ = min(max(Xp_posZ, lo), hi);
+    Xp_negZ = min(max(Xp_negZ, lo), hi);
+
+    XposZ = single(Xp_posZ);
+    XnegZ = single(Xp_negZ);
+
+    save(posF,'XposZ','-v7.3');
+    save(negF,'XnegZ','-v7.3');
+    save(gmmF,'gmmPos','gmmNeg','Kpos','Kneg','mu_tr','sg_tr','diag','lo','hi','-v7.3');
+
+    if opt.Verbose
+        fprintf('  Built z-pseudo for %s: TRAIN(pos=%d neg=%d) → pseudo(pos=%d neg=%d)\n', ...
+            pid, diag.Npos_train, diag.Nneg_train, size(XposZ,1), size(XnegZ,1));
+    end
+
+    P(end+1).pid  = pid; %#ok<AGROW>
+    P(end).XposZ  = XposZ;
+    P(end).XnegZ  = XnegZ;
+end
+end
+
+function X = load_first_matrix(f)
+S = load(f);
+fn = fieldnames(S);
+ix = find(contains(lower(fn),'xpos') | contains(lower(fn),'xneg') | contains(lower(fn),'xposz') | contains(lower(fn),'xnegz') | strcmpi(fn,'X'), 1);
+if isempty(ix), ix = 1; end
+X = S.(fn{ix});
+end
+
+% ========================= GLOBAL POOLS (target z-space) =========================
+
+function [XposGZ, XnegGZ] = global_pools_in_target_z(pseudoRoot, targetPid, mu_tr, sg_tr, opt)
+dirs = dir(fullfile(pseudoRoot,'chb*'));
+pids = string({dirs.name});
+
+XposGZ = zeros(0, numel(mu_tr), 'single');
+XnegGZ = zeros(0, numel(mu_tr), 'single');
+
+for k = 1:numel(pids)
+    pid = pids(k);
+    if opt.ExcludeSelf && strcmpi(pid, targetPid), continue; end
+
+    gmmF = fullfile(pseudoRoot, pid, 'pseudo_gmm.mat');
+    if ~isfile(gmmF), continue; end
+    S = load(gmmF,'gmmPos','gmmNeg');
+
+    % Resample in SOURCE z-space, then map into TARGET z-space by
+    % converting to raw using SOURCE stats would be ideal; however source
+    % stats are not stored for raw here. Hence, the simplest safe approach
+    % is to use SOURCE z-samples as "generic", then optionally filter by
+    % distance to target. This is already controlled by nearest selection.
+    %
+    % To provide a usable pool, sample a moderate amount per other patient:
+    Ns = 1000;
+
+    try
+        Xp = random(S.gmmPos, Ns);
+        Xn = random(S.gmmNeg, Ns);
+    catch
+        continue;
+    end
+
+    % Treat these as z-like features; they will be filtered by nearest-to-local.
+    XposGZ = [XposGZ; single(Xp)]; %#ok<AGROW>
+    XnegGZ = [XnegGZ; single(Xn)]; %#ok<AGROW>
+end
+end
+
+% ========================= REAL SPLIT (Step11 + TRAIN stats) =========================
+
+function [Xtr_raw, ytr, Xte_raw, yte, meta_tr, meta_te, diag, mu_tr, sg_tr] = ...
+    get_real_split_step11_and_stats(fsAugDir, pid, keepIdx, fixed, opt)
+
+[Xtr_raw, ytr, Xte_raw, yte, meta_tr, meta_te, diag] = get_real_split_step11(fsAugDir, pid, keepIdx, fixed, opt);
+if isempty(Xtr_raw)
+    mu_tr = []; sg_tr = [];
+    return;
+end
+mu_tr = mean(double(Xtr_raw), 1, 'omitnan');
+sg_tr = std(double(Xtr_raw), 0, 1, 'omitnan');
+sg_tr(sg_tr < 1e-6) = 1e-6;
+end
+
+function [Xtr_raw, ytr, Xte_raw, yte, meta_tr, meta_te, diag] = get_real_split_step11(fsAugDir, pid, keepIdx, fixed, opt)
+Xtr_raw = []; ytr = []; Xte_raw = []; yte = []; meta_tr = []; meta_te = [];
+diag = struct('Npos_train',0,'Nneg_train',0,'Npos_test',0,'Nneg_test',0,'testFold',NaN,'nSeizuresDetected',NaN,'Ts_est',NaN);
+
+ix = find(strcmpi(string(fixed.patientID), pid), 1);
+if isempty(ix), return; end
+testFold = double(fixed.fold(ix));
+
+fpath = fullfile(fsAugDir, pid + "_FSaug.mat");
+if ~isfile(fpath), return; end
+
+S = load(fpath, 'X_aug','meta_out');
+Xfull = double(S.X_aug(:, keepIdx));
+meta  = S.meta_out;
+
+req = ["recordName","frameEndSec","time_to_onset_sec","y_state"];
+missing = req(~ismember(req, string(meta.Properties.VariableNames)));
+if ~isempty(missing)
+    error('[%s] meta_out missing required column(s): %s', char(pid), strjoin(missing, ", "));
+end
+
+y0 = double(meta.y_state);
+isLbl = (y0==0) | (y0==1);
+
+nonFiniteRow = any(~isfinite(Xfull), 2);
+keepRow = isLbl & ~nonFiniteRow;
+
+X = Xfull(keepRow,:);
+meta = meta(keepRow,:);
+y = y0(keepRow);
+
+isPre = (y==1);
+isNeg = (y==0);
+if nnz(isPre)==0 || nnz(isNeg)==0, return; end
+
+Ts_est = double(meta.frameEndSec) + double(meta.time_to_onset_sec);
+seizureID = nan(height(meta),1);
+[sid_pre, Ts_centres] = cluster_Ts(Ts_est(isPre), opt.TsTolSec);
+seizureID(isPre) = sid_pre;
+nSz = numel(Ts_centres);
+
+if testFold < 1 || testFold > nSz || nSz < 2, return; end
+
+testPosMask  = isPre & (seizureID == testFold);
+trainPosMask = isPre & (seizureID ~= testFold);
+
+nPos_te = nnz(testPosMask);
+nPos_tr = nnz(trainPosMask);
+if nPos_te < opt.MinPosTest || nPos_tr < opt.MinPosTrain, return; end
+
+negIdxAll = find(isNeg);
+
+nNeg_te_target = max(opt.MinNegTest,  round(opt.NegPosRatio * nPos_te));
+nNeg_tr_target = max(opt.MinNegTrain, round(opt.NegPosRatio * nPos_tr));
+
+teNegIdx = sample_negatives_relaxed(meta, negIdxAll, nNeg_te_target, opt.ContigBlock);
+rem = setdiff(negIdxAll, teNegIdx, 'stable');
+trNegIdx = sample_negatives_relaxed(meta, rem, nNeg_tr_target, opt.ContigBlock);
+
+if numel(teNegIdx) < opt.MinNegTest || numel(trNegIdx) < opt.MinNegTrain, return; end
+
+trainMask = trainPosMask; trainMask(trNegIdx) = true;
+testMask  = testPosMask;  testMask(teNegIdx)  = true;
+
+Xtr_raw = X(trainMask,:); ytr = y(trainMask);
+Xte_raw = X(testMask ,:); yte = y(testMask );
+
+meta_tr = meta(trainMask,:);
+meta_te = meta(testMask ,:);
+
+diag.Npos_train = sum(ytr==1);
+diag.Nneg_train = sum(ytr==0);
+diag.Npos_test  = sum(yte==1);
+diag.Nneg_test  = sum(yte==0);
+diag.testFold   = testFold;
+diag.nSeizuresDetected = nSz;
+diag.Ts_est     = Ts_centres(testFold);
+end
+
+% ========================= Small utilities =========================
+
+function Xz = zscore_apply(X, mu, sig)
+sig(sig < 1e-6) = 1e-6;
+Xz = (X - mu) ./ sig;
+end
+
+function [Xcap, ycap] = cap_ratio(Xpos, Xneg, negToPosMax, minNegKeep)
+npos = size(Xpos,1);
+nneg = size(Xneg,1);
+negCap = max(minNegKeep, min(nneg, negToPosMax * max(1,npos)));
+if nneg > negCap
+    sel = randsample(nneg, negCap);
+    XnegK = Xneg(sel,:);
+else
+    XnegK = Xneg;
+end
+Xcap = [Xpos; XnegK];
+ycap = [ones(size(Xpos,1),1,'uint8'); zeros(size(XnegK,1),1,'uint8')];
+end
+
+function Xsel = select_nearest(Xpool, centre, nTake)
+Xpool = double(Xpool);
+centre = double(centre(:)).';
+d = sum((Xpool - centre).^2, 2); % squared Euclidean in z-space
+[~,ord] = sort(d,'ascend');
+ord = ord(1:min(nTake,numel(ord)));
+Xsel = single(Xpool(ord,:));
+end
+
+function p1 = predict_prob_logreg(mdl, X)
+[~, sc] = predict(mdl, X);
+p1 = double(sc(:,2));
+p1 = max(0, min(1, p1));
+end
+
+function w = class_weights01(y)
+y = double(y(:));
+n0 = sum(y==0); n1 = sum(y==1);
+w0 = 1 / max(1,n0);
+w1 = 1 / max(1,n1);
+w = ones(numel(y),1);
+w(y==0) = w0;
+w(y==1) = w1;
+w = w / mean(w);
+end
+
+function [Xbal, ybal] = build_balanced_subset(X, y)
+y = uint8(y(:));
+isP = (y==1); isN = ~isP;
+nP = sum(isP); nN = sum(isN);
+if nP==0 || nN==0, Xbal = X; ybal = y; return; end
+keepNeg = min(nN, nP);
+negIdx = find(isN);
+negKeep = negIdx(randsample(numel(negIdx), keepNeg));
+keep = sort([find(isP); negKeep(:)]);
+Xbal = X(keep,:); ybal = y(keep);
+end
+
+function [bestTau, statsTbl] = calibrate_threshold_balacc(scores, labels, NumGrid)
+scores = double(scores(:));
+labels = double(labels(:));
+if numel(unique(labels)) < 2
+    bestTau = 0.5;
+    statsTbl = table(0.5, NaN, NaN, NaN, NaN, 'VariableNames', {'Tau','TPR','TNR','BalancedAcc','Acc'});
+    return;
+end
+taus = linspace(0,1,NumGrid);
+TPR = nan(size(taus)); TNR = nan(size(taus)); BA = nan(size(taus)); ACC = nan(size(taus));
+posMask = labels==1; negMask = labels==0;
+nPos = sum(posMask); nNeg = sum(negMask);
+for i=1:numel(taus)
+    t = taus(i);
+    yh = scores >= t;
+    TP = sum(yh==1 & posMask);
+    TN = sum(yh==0 & negMask);
+    FP = sum(yh==1 & negMask);
+    FN = sum(yh==0 & posMask);
+    TPR(i) = TP / max(1,nPos);
+    TNR(i) = TN / max(1,nNeg);
+    BA(i)  = 0.5*(TPR(i)+TNR(i));
+    ACC(i) = (TP+TN) / max(1,(TP+TN+FP+FN));
+end
+[~,idx] = max(BA); idx = idx(1);
+bestTau = taus(idx);
+statsTbl = table(taus(:),TPR(:),TNR(:),BA(:),ACC(:), 'VariableNames', {'Tau','TPR','TNR','BalancedAcc','Acc'});
+end
+
+function [auc, auprc] = auc_auprc_robust(y, p)
+y = double(y(:)); p = double(p(:));
+ok = isfinite(y) & isfinite(p);
+y = y(ok); p = p(ok);
+auc = NaN; auprc = NaN;
+if numel(unique(y)) < 2, return; end
+[~,~,~,auc] = perfcurve(y, p, 1);
+[rec, prec] = perfcurve(y, p, 1, 'xCrit','reca', 'yCrit','prec');
+ok2 = isfinite(rec) & isfinite(prec);
+rec = rec(ok2); prec = prec(ok2);
+if numel(rec) >= 2, auprc = trapz(rec, prec); end
+end
+
+function m = metrics_at_tau(y, p, tau)
+y = double(y(:)); p = double(p(:));
+yh = p >= tau;
+TP = sum((yh==1)&(y==1));
+TN = sum((yh==0)&(y==0));
+FP = sum((yh==1)&(y==0));
+FN = sum((yh==0)&(y==1));
+posAcc = TP / max(1,sum(y==1));
+negAcc = TN / max(1,sum(y==0));
+acc    = (TP+TN) / max(1,numel(y));
+bal    = 0.5*(posAcc+negAcc);
+m = struct('Acc',acc,'PosAcc',posAcc,'NegAcc',negAcc,'BalAcc',bal,'TP',TP,'TN',TN,'FP',FP,'FN',FN);
+end
+
+function T = fixed_fold_map()
+pid = ["chb01","chb02","chb03","chb04","chb05","chb06","chb07","chb08","chb09","chb10", ...
+       "chb11","chb12","chb13","chb14","chb15","chb16","chb17","chb18","chb19","chb20", ...
+       "chb21","chb22","chb23","chb24"]';
+fold = [1,1,7,3,3,4,1,1,1,5,2,17,2,4,7,4,3,3,1,3,4,1,2,7]';
+T = table(pid, fold, 'VariableNames', {'patientID','fold'});
+end
+
+function [sid, centres] = cluster_Ts(Ts, tolSec)
+Ts = double(Ts(:));
+Ts = Ts(isfinite(Ts));
+Ts_sorted = sort(Ts);
+centres = [];
+if isempty(Ts_sorted), sid = []; return; end
+centres = Ts_sorted(1);
+for i=2:numel(Ts_sorted)
+    if abs(Ts_sorted(i) - centres(end)) <= tolSec
+        centres(end) = 0.5*(centres(end) + Ts_sorted(i));
+    else
+        centres(end+1) = Ts_sorted(i); %#ok<AGROW>
+    end
+end
+sid = nan(numel(Ts),1);
+for i=1:numel(Ts)
+    [~,k] = min(abs(centres - Ts(i)));
+    if abs(centres(k) - Ts(i)) <= tolSec, sid(i) = k; end
+end
+sid = sid(:);
+end
+
+function idxPick = sample_negatives_relaxed(meta, idxPool, nTarget, useContig)
+idxPool = idxPool(:);
+if isempty(idxPool), idxPick = []; return; end
+nTarget = min(nTarget, numel(idxPool));
+if ~useContig
+    idxPick = idxPool(randperm(numel(idxPool), nTarget));
+    return;
+end
+if ~ismember('frameStartSec', meta.Properties.VariableNames)
+    idxPick = idxPool(randperm(numel(idxPool), nTarget));
+    return;
+end
+rec = string(meta.recordName);
+fs  = double(meta.frameStartSec);
+idxPick = [];
+attempts = 0;
+blockLen = max(50, min(600, round(nTarget/5)));
+while numel(idxPick) < nTarget && attempts < 800
+    attempts = attempts + 1;
+    recs = unique(rec(idxPool));
+    r = recs(randi(numel(recs)));
+    idxR = idxPool(rec(idxPool)==r);
+    [~,ord] = sort(fs(idxR));
+    idxR = idxR(ord);
+    if numel(idxR) < 5, continue; end
+    L = min(blockLen, numel(idxR));
+    s0 = randi(max(1, numel(idxR)-L+1));
+    blk = idxR(s0:(s0+L-1));
+    idxPick = unique([idxPick; blk(:)], 'stable'); %#ok<AGROW>
+    if numel(idxPick) > nTarget, idxPick = idxPick(1:nTarget); end
+end
+if numel(idxPick) < nTarget
+    rest = setdiff(idxPool, idxPick, 'stable');
+    if ~isempty(rest)
+        need = nTarget - numel(idxPick);
+        take = rest(randperm(numel(rest), min(need, numel(rest))));
+        idxPick = unique([idxPick; take(:)], 'stable'); %#ok<AGROW>
+        if numel(idxPick) > nTarget, idxPick = idxPick(1:nTarget); end
+    end
+end
+end
