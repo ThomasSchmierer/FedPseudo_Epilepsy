@@ -1,0 +1,492 @@
+    function step12_hybrid_local_plus_global_adaptive_V2(rootDir, repSubdir, varargin)
+    % STEP12 (adaptive) — Local-first + small global pseudo boost (personalised hybrid)
+    %
+    % This version:
+    %   - Uses local pseudo data + a small adaptive fraction of global pseudo data
+    %   - Trains a local CNN, then fine-tunes a hybrid CNN
+    %   - Derives a per-patient decision threshold tau_star from a
+    %     balanced VALIDATION subset built from the REAL TRAINING rows
+    %   - Evaluates on held-out REAL test rows, providing:
+    %         * TEST-A: balanced test subset
+    %         * TEST-B: full test set
+    %
+    % No real test data are used in threshold optimisation (no leakage).
+    %
+    % Global CSV:
+    %   .../fed/pseudo_data/hybrid_eval_summary_adaptive.csv
+    %
+    % Columns:
+    %   patient | effFracPos | effFracNeg | A_AUC | A_AccI | A_AccN | B_AUC | B_AccI | B_AccN | tau_star
+    
+    % ---------- Options ----------
+    p = inputParser;
+    addParameter(p,'Patients', string(compose("chb%02d",1:24)));
+    addParameter(p,'FeatureMaskFile', "keepIdx_topK_15.mat");
+    addParameter(p,'NegToPosMaxRatio', 10);
+    addParameter(p,'MinNegKeep', 2000);
+    addParameter(p,'GlobalFrac', 0.15);       % baseline fraction of LOCAL counts to add (per class)
+    addParameter(p,'ExcludeSelf', true);
+    addParameter(p,'LocalEpochs', 25);
+    addParameter(p,'HybridEpochs', 10);
+    addParameter(p,'MiniBatchSize', 256);
+    addParameter(p,'InitialLearnRate', 5e-4);
+    addParameter(p,'HybridLearnRate', 1e-4);
+    addParameter(p,'L2Regularization', 1e-4);
+    addParameter(p,'Dropout', 0.30);
+    addParameter(p,'Seed', 42);
+    addParameter(p,'Verbose', true);
+    parse(p,varargin{:});
+    opt = p.Results;
+    if isfinite(opt.Seed), rng(opt.Seed,'twister'); end
+    
+    repDir     = fullfile(rootDir, repSubdir);
+    pseudoRoot = fullfile(repDir, 'models_cnn1d_binary','fed','pseudo_data');
+    modelDir   = fullfile(repDir, 'models_cnn1d_binary');
+    
+    assert(isfolder(pseudoRoot),'Pseudo root not found: %s', pseudoRoot);
+    
+    % ---------- Discover patients with pseudo ----------
+    dirs = dir(fullfile(pseudoRoot,'chb*'));
+    allPids = string({dirs.name});
+    keep = ismember(lower(allPids), lower(opt.Patients));
+    dirs = dirs(keep); allPids = allPids(keep);
+    numP = numel(dirs);
+    assert(numP>0,'No matching patient pseudo dirs.');
+    
+    % ---------- Load global pseudo once (class-tagged, by patient) ----------
+    G = struct('pid',[],'Xpos',[],'Xneg',[]);
+    for i = 1:numP
+        pid = allPids(i);
+        posF = fullfile(dirs(i).folder, dirs(i).name, 'pseudo_pos.mat');
+        negF = fullfile(dirs(i).folder, dirs(i).name, 'pseudo_neg.mat');
+        assert(isfile(posF)&&isfile(negF), '[%s] missing pseudo_pos/neg.mat', pid);
+        Xpos = load_first_matrix(posF);
+        Xneg = load_first_matrix(negF);
+        if i==1
+            D = size(Xpos,2);
+        else
+            assert(size(Xpos,2)==D && size(Xneg,2)==D,'Feature dim mismatch');
+        end
+        G(i).pid  = pid;
+        G(i).Xpos = single(Xpos);
+        G(i).Xneg = single(Xneg);
+    end
+    assert(D==15,'This script expects 15 features via mask %s (got D=%d).', opt.FeatureMaskFile, D);
+    
+    rows = {};
+    if opt.Verbose
+        fprintf('\n=== Local-first + small global boost (adaptive, D=%d) ===\n', D);
+    end
+    
+    % ---------- Loop patients ----------
+    for i = 1:numP
+        pid = allPids(i);
+        if opt.Verbose, fprintf('\n== %s ==\n', pid); end
+        pdir = fullfile(pseudoRoot, pid);
+    
+        % -- Local pseudo (unchanged) --
+        Xpos_loc = G(i).Xpos;
+        Xneg_loc = G(i).Xneg;
+        [Xloc, yloc] = cap_ratio(Xpos_loc, Xneg_loc, opt.NegToPosMaxRatio, opt.MinNegKeep);
+        nLocPos = sum(yloc==1);
+        nLocNeg = sum(yloc==0);
+    
+        % μ/σ from LOCAL (preserve local scale)
+        mu_loc = mean(Xloc,1);
+        sg_loc = std(Xloc,0,1);
+        sg_loc(sg_loc<1e-6) = 1e-6;
+    
+        % -- Prepare global pools (exclude self if requested), pooled by class --
+        Xpos_glob = [];
+        Xneg_glob = [];
+        for j = 1:numP
+            if opt.ExcludeSelf && j==i, continue; end
+            Xpos_glob = [Xpos_glob; G(j).Xpos]; %#ok<AGROW>
+            Xneg_glob = [Xneg_glob; G(j).Xneg]; %#ok<AGROW>
+        end
+    
+        % ---- Adaptive choice of added global samples per class ----
+        fracBase = opt.GlobalFrac;
+        negPos = max(0.1, min(10, nLocNeg / max(1,nLocPos)));
+        adjNeg = 0.85 + 0.15 * min(1, max(0, (2*negPos) / (1+negPos)));
+        adjPos = 0.85 + 0.15 * min(1, max(0, (2/(1+negPos))));
+    
+        nPosAdd = round(fracBase * nLocPos * adjPos);
+        nNegAdd = round(fracBase * nLocNeg * adjNeg);
+    
+        % Bound by availability
+        nPosAdd = min(nPosAdd, size(Xpos_glob,1));
+        nNegAdd = min(nNegAdd, size(Xneg_glob,1));
+    
+        if nPosAdd>0 && ~isempty(Xpos_glob)
+            sel = randsample(size(Xpos_glob,1), nPosAdd);
+            Xpos_add = Xpos_glob(sel,:);
+        else
+            Xpos_add = zeros(0,D,'single');
+        end
+    
+        if nNegAdd>0 && ~isempty(Xneg_glob)
+            sel = randsample(size(Xneg_glob,1), nNegAdd);
+            Xneg_add = Xneg_glob(sel,:);
+        else
+            Xneg_add = zeros(0,D,'single');
+        end
+    
+        effFracPos = nPosAdd / max(1,nLocPos);
+        effFracNeg = nNegAdd / max(1,nLocNeg);
+    
+        % Combine for hybrid train (then cap ratio again to avoid skew)
+        Xhy_raw = [Xloc; Xpos_add; Xneg_add];
+        yhy_raw = [yloc; ...
+            ones(size(Xpos_add,1),1,'uint8'); ...
+            zeros(size(Xneg_add,1),1,'uint8')];
+    
+        [Xhy, yhy] = cap_ratio( ...
+            Xhy_raw(yhy_raw==1,:), ...
+            Xhy_raw(yhy_raw==0,:), ...
+            opt.NegToPosMaxRatio, opt.MinNegKeep);
+    
+        % Z-score (LOCAL stats)
+        XlocZ = (Xloc - mu_loc)./sg_loc;
+        XlocZ(~isfinite(XlocZ)) = 0;
+        XhyZ  = (Xhy  - mu_loc)./sg_loc;
+        XhyZ(~isfinite(XhyZ))  = 0;
+    
+        % ---------- Build Step05-ish CNN (15f) ----------
+        lgraph = build_step05_layers(D, opt.Dropout);  % FC(2)+softmax+classificationLayer
+    
+        % Paths for models
+        f_local  = fullfile(pdir,'net_local.mat');
+        f_hybrid = fullfile(pdir,'net_hybrid_adaptive.mat');
+    
+        % ---------- Train or load LOCAL model ----------
+        if isfile(f_local)
+            Slocal = load(f_local); net_local = Slocal.net_local;
+            if opt.Verbose, fprintf('  Loaded local model.\n'); end
+        else
+            if opt.Verbose
+                fprintf('  Training local model: N=%d (pos=%d, neg=%d)\n', size(Xloc,1), nLocPos, nLocNeg);
+            end
+            [imgs, Yc] = to_image_labels(XlocZ, yloc);
+            opts = trainingOptions('adam', ...
+                'MaxEpochs', opt.LocalEpochs, ...
+                'MiniBatchSize', opt.MiniBatchSize, ...
+                'InitialLearnRate', opt.InitialLearnRate, ...
+                'L2Regularization', opt.L2Regularization, ...
+                'Shuffle','every-epoch','Verbose',false);
+            net_local = trainNetwork(imgs, Yc, lgraph, opts);
+            save(f_local,'net_local','mu_loc','sg_loc','-v7.3');
+        end
+    
+        % ---------- Fine-tune (HYBRID: local ⊕ small-global) ----------
+        if opt.Verbose
+            fprintf('  Fine-tuning hybrid: N=%d (pos=%d, neg=%d) | eff add frac (pos=%.3f, neg=%.3f)\n', ...
+                size(Xhy,1), sum(yhy==1), sum(yhy==0), effFracPos, effFracNeg);
+        end
+        [imgH, YcH] = to_image_labels(XhyZ, yhy);
+        optsH = trainingOptions('adam', ...
+            'MaxEpochs', opt.HybridEpochs, ...
+            'MiniBatchSize', opt.MiniBatchSize, ...
+            'InitialLearnRate', opt.HybridLearnRate, ...
+            'L2Regularization', opt.L2Regularization, ...
+            'Shuffle','every-epoch','Verbose',false);
+        net_hybrid = trainNetwork(imgH, YcH, layerGraph(net_local.Layers), optsH);
+        save(f_hybrid,'net_hybrid','mu_loc','sg_loc','opt','effFracPos','effFracNeg','-v7.3');
+    
+        % ---------- Load real data + splits ----------
+        Mteach = dir(fullfile(modelDir, 'chb*_cnn1d_binary.mat'));
+        mt = find(strcmpi(erase(string({Mteach.name}), '_cnn1d_binary.mat'), pid), 1);
+        if isempty(mt)
+            warning('[%s] Teacher model not found; skipping evaluation.', pid);
+            continue;
+        end
+        Smod = load(fullfile(Mteach(mt).folder, Mteach(mt).name)); % net, repFile, splFile
+        Srep = load(Smod.repFile,'X','Y');
+        Sspl = load(Smod.splFile);
+        [trainRows, testRows] = get_split_rows(Sspl, numel(Srep.Y));
+    
+        % ---------- Build TRAIN-based validation set for tau_star ----------
+        Xtr_all = single(Srep.X(trainRows,:));
+        ytr     = uint8(Srep.Y(trainRows)==2);          % 1 = ictal, 0 = non-ictal
+        keepIdx = get_mask_robust(fullfile(repDir,opt.FeatureMaskFile), size(Xtr_all,2));
+        Xtr     = Xtr_all(:, keepIdx);
+        XtrZ    = (Xtr - mu_loc)./sg_loc;
+        XtrZ(~isfinite(XtrZ)) = 0;
+    
+        [Xval, yVal] = build_balanced_subset(XtrZ, ytr);  % balanced validation from TRAIN
+    
+        pVal = predict_prob(net_hybrid, Xval, D);
+        [tau_star, ~] = calibrate_threshold_balacc(pVal, yVal);
+    
+        % ---------- Evaluate on held-out TEST rows (TEST-A / TEST-B views) ----------
+        Xte_all = single(Srep.X(testRows,:));
+        yte     = uint8(Srep.Y(testRows)==2);
+        Xte     = Xte_all(:, keepIdx);
+        XteZ    = (Xte - mu_loc)./sg_loc;
+        XteZ(~isfinite(XteZ)) = 0;
+    
+        [XA, yA, XB, yB] = build_test_sets(XteZ, yte);  % TEST-A (balanced), TEST-B (full)
+    
+        pA = predict_prob(net_hybrid, XA, D);
+        pB = predict_prob(net_hybrid, XB, D);
+    
+        mA = metrics_bin(yA, pA, tau_star);
+        mB = metrics_bin(yB, pB, tau_star);
+    
+        if opt.Verbose
+            fprintf(['  HYBRID  AUC(A)=%.3f AccI(A)=%.3f AccN(A)=%.3f | ', ...
+                     'AUC(B)=%.3f AccI(B)=%.3f AccN(B)=%.3f | tau*=%.3f\n'], ...
+                mA.AUROC, mA.AccIctal, mA.AccNon, ...
+                mB.AUROC, mB.AccIctal, mB.AccNon, tau_star);
+        end
+    
+        rows{end+1,1} = table(pid, effFracPos, effFracNeg, ...
+            mA.AUROC, mA.AccIctal, mA.AccNon, ...
+            mB.AUROC, mB.AccIctal, mB.AccNon, tau_star, ...
+            'VariableNames', {'patient','effFracPos','effFracNeg', ...
+            'A_AUC','A_AccI','A_AccN','B_AUC','B_AccI','B_AccN','tau_star'});
+    end
+    
+    % ---------- Write summary CSV ----------
+    if ~isempty(rows)
+        Tout = vertcat(rows{:});
+        outCSV = fullfile(pseudoRoot, 'hybrid_eval_summary_adaptive.csv');
+        writetable(Tout, outCSV);
+        if opt.Verbose
+            fprintf('\nSaved hybrid evaluation summary → %s\n', outCSV);
+        end
+    end
+    end
+    
+    % =============== Helpers ===============
+    
+    function X = load_first_matrix(f)
+    S = load(f);
+    fn = fieldnames(S);
+    ix = find(contains(lower(fn),'xp') | strcmpi(fn,'X'),1);
+    if isempty(ix), ix = 1; end
+    X = single(S.(fn{ix}));
+    end
+    
+    function [Xcap, ycap] = cap_ratio(Xpos, Xneg, negToPosMax, minNegKeep)
+    npos = size(Xpos,1);
+    nneg = size(Xneg,1);
+    negCap = max(minNegKeep, min(nneg, negToPosMax * max(1,npos)));
+    if nneg > negCap
+        sel = randsample(nneg, negCap);
+        XnegK = Xneg(sel,:);
+    else
+        XnegK = Xneg;
+    end
+    Xcap = [Xpos; XnegK];
+    ycap = [ones(size(Xpos,1),1,'uint8'); zeros(size(XnegK,1),1,'uint8')];
+    end
+    
+    function keepIdx = get_mask_robust(maskPath, Dfull)
+    if isfile(maskPath)
+        Sm = load(maskPath);
+        if isfield(Sm,'keepIdx')
+            keepIdx = double(Sm.keepIdx(:));
+            keepIdx = keepIdx(keepIdx>=1 & keepIdx<=Dfull);
+            return;
+        end
+    end
+    keepIdx = (1:15).'; % fallback
+    end
+    
+    function [trRows, teRows] = get_split_rows(Sspl, N)
+    if isfield(Sspl,'trainRows')
+        trRows = double(Sspl.trainRows(:));
+    elseif isfield(Sspl,'trainMask')
+        trRows = find(logical(Sspl.trainMask(:)));
+    else
+        error('Split missing trainRows/trainMask');
+    end
+    
+    if isfield(Sspl,'testRows')
+        teRows = double(Sspl.testRows(:));
+    elseif isfield(Sspl,'testMask')
+        teRows = find(logical(Sspl.testMask(:)));
+    else
+        mTe = true(N,1);
+        mTe(trRows) = false;
+        teRows = find(mTe);
+    end
+    end
+    
+    function [Xbal, ybal] = build_balanced_subset(X, y)
+    % BUILD_BALANCED_SUBSET  Create a balanced subset (all ictal + matched non-ictal)
+    isP = (y==1);
+    isN = ~isP;
+    nP  = sum(isP);
+    nN  = sum(isN);
+    
+    if nP==0 || nN==0
+        % Degenerate case: return all data
+        Xbal = X;
+        ybal = y;
+        return;
+    end
+    
+    keepNeg = min(nN, nP);
+    negIdx  = find(isN);
+    negKeep = negIdx(randsample(numel(negIdx), keepNeg));
+    keep    = sort([find(isP); negKeep(:)]);
+    
+    Xbal = X(keep,:);
+    ybal = y(keep);
+    end
+    
+    function [XA,yA,XB,yB] = build_test_sets(Xte, yte)
+    % TEST-A: balanced subset; TEST-B: full test
+    isP = yte==1;
+    isN = ~isP;
+    keepNeg = min(sum(isN), sum(isP));
+    negIdx  = find(isN);
+    if ~isempty(negIdx) && keepNeg>0
+        negKeep = negIdx(randsample(numel(negIdx), keepNeg));
+    else
+        negKeep = [];
+    end
+    keepA = sort([find(isP); negKeep(:)]);
+    XA = Xte(keepA,:);  yA = yte(keepA);
+    XB = Xte;           yB = yte;
+    end
+    
+    function [imgs, Yc] = to_image_labels(X, y)
+    D = size(X,2);
+    imgs = reshape(single(X.'), [1 D 1 size(X,1)]);
+    Yc   = categorical(y,[0 1],{'non','ictal'});
+    end
+    
+    function p = predict_prob(net, X, D)
+    imgs = reshape(single(X.'), [1 D 1 size(X,1)]);
+    p2 = predict(net, imgs);
+    if ndims(p2)==2
+        p = p2(:,2);
+    else
+        p = reshape(p2(1,1,2,:),[],1);
+    end
+    p = max(0,min(1, p));
+    end
+    
+    function lgraph = build_step05_layers(D, Drop)
+    layers = [
+        imageInputLayer([1 D 1], 'Normalization','none','Name','input')
+        convolution2dLayer([1 7],64,'Padding','same','Name','conv1')
+        reluLayer('Name','relu1')
+        convolution2dLayer([1 5],64,'Padding','same','Name','conv2')
+        reluLayer('Name','relu2')
+        dropoutLayer(Drop,'Name','drop1')
+        fullyConnectedLayer(128,'Name','fc1')
+        reluLayer('Name','relu3')
+        dropoutLayer(Drop,'Name','drop2')
+        fullyConnectedLayer(2,'Name','fcOut')
+        softmaxLayer('Name','softmax')
+        classificationLayer('Name','classoutput')];
+    lgraph = layerGraph(layers);
+    end
+    
+    function m = metrics_bin(ytrue, p, thr)
+    y = logical(ytrue(:));
+    p = p(:);
+    try
+        [~,~,~,auroc] = perfcurve(y, p, true);
+    catch
+        auroc = NaN;
+    end
+    yhat = p>=thr;
+    tp = sum(yhat &  y);
+    fn = sum(~yhat & y);
+    tn = sum(~yhat & ~y);
+    fp = sum(yhat & ~y);
+    
+    accI = tp / max(tp+fn,1);
+    accN = tn / max(tn+fp,1);
+    prec = tp / max(tp+fp,1);
+    rec  = tp / max(tp+fn,1);
+    f1   = 2*prec*rec / max(prec+rec, eps);
+    
+    m = struct('AUROC',auroc,'AccIctal',accI,'AccNon',accN,'F1',f1);
+    end
+    
+    function [bestTau, statsTbl] = calibrate_threshold_balacc(scores, labels, varargin)
+    % CALIBRATE_THRESHOLD_BALACC  Choose per-patient threshold to maximise balanced accuracy.
+    %
+    % INPUTS
+    %   scores : [N x 1] predicted probabilities for ictal = 1
+    %   labels : [N x 1] true labels in {0,1}
+    %
+    % OPTIONAL
+    %   'NumGrid' : number of thresholds in grid search (default 201)
+    %
+    % OUTPUTS
+    %   bestTau : scalar threshold that maximises balanced accuracy
+    %   statsTbl: table of thresholds and metrics (optional)
+    
+    p = inputParser;
+    addParameter(p, 'NumGrid', 201, @(x)isnumeric(x)&&isscalar(x)&&x>=3);
+    parse(p, varargin{:});
+    NumGrid = p.Results.NumGrid;
+    
+    scores = scores(:);
+    labels = labels(:);
+    
+    if numel(scores) ~= numel(labels)
+        error('scores and labels must have the same length.');
+    end
+    
+    uLabs = unique(labels);
+    if numel(uLabs) < 2
+        bestTau = 0.5;
+        statsTbl = table(0.5, NaN, NaN, NaN, NaN, ...
+            'VariableNames', {'Tau','TPR','TNR','BalancedAcc','Acc'});
+        return;
+    end
+    
+    taus = linspace(0,1,NumGrid);
+    TPR  = nan(size(taus));
+    TNR  = nan(size(taus));
+    BA   = nan(size(taus));
+    ACC  = nan(size(taus));
+    
+    y      = labels;
+    posMask = (y == 1);
+    negMask = (y == 0);
+    nPos    = sum(posMask);
+    nNeg    = sum(negMask);
+    
+    for i = 1:numel(taus)
+        t    = taus(i);
+        yhat = scores >= t;
+    
+        TP = sum( yhat==1 & posMask );
+        TN = sum( yhat==0 & negMask );
+        FP = sum( yhat==1 & negMask );
+        FN = sum( yhat==0 & posMask );
+    
+        if nPos > 0
+            TPR(i) = TP / nPos;
+        else
+            TPR(i) = NaN;
+        end
+        if nNeg > 0
+            TNR(i) = TN / nNeg;
+        else
+            TNR(i) = NaN;
+        end
+    
+        BA(i)  = 0.5 * (TPR(i) + TNR(i));
+        ACC(i) = (TP + TN) / max(1, (TP+TN+FP+FN));
+    end
+    
+    [~, idxBest] = max(BA);
+    idxBest      = idxBest(1);  % in case of ties
+    
+    bestTau = taus(idxBest);
+    
+    if nargout > 1
+        statsTbl = table(taus(:), TPR(:), TNR(:), BA(:), ACC(:), ...
+            'VariableNames', {'Tau','TPR','TNR','BalancedAcc','Acc'});
+    end
+    end
