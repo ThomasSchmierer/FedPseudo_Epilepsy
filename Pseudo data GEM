@@ -1,0 +1,236 @@
+function step09_local_pseudo_gmm(rootDir, repSubdir, varargin)
+% STEP09_LOCAL_PSEUDO_GMM
+% Model-based pseudo generation using Gaussian Mixture Models.
+%
+% 1) Train baseline CNN on TRAIN
+% 2) Evaluate on TEST-A/B
+% 3) Fit per-class GMMs on TRAIN features
+% 4) Generate balanced pseudo data (ictal/non-ictal)
+% 5) Train CNN on pseudo data
+% 6) Evaluate pseudo-CNN on TEST-A/B
+%
+% Saves each patient's model and writes a combined CSV summary.
+
+p = inputParser;
+addParameter(p,'Patients',string(compose("chb%02d",1:24)));
+addParameter(p,'FeatureMaskFile',"keepIdx_topK_15.mat");
+addParameter(p,'TargetPerClass',2000);
+addParameter(p,'GMMComponents',3);
+addParameter(p,'MaxEpochs',25);
+addParameter(p,'MiniBatchSize',256);
+addParameter(p,'InitialLearnRate',5e-4);
+addParameter(p,'Seed',42);
+parse(p,varargin{:});
+opt = p.Results;
+
+if isfinite(opt.Seed), rng(opt.Seed,'twister'); end
+
+repDir = fullfile(rootDir, repSubdir);
+outDir = fullfile(repDir,"models_cnn1d_binary","fed","local_pseudo_gmm");
+if ~isfolder(outDir), mkdir(outDir); end
+
+M = dir(fullfile(repDir,"models_cnn1d_binary","chb*_cnn1d_binary.mat"));
+assert(~isempty(M),'No teacher models found.');
+
+summaryT = table();
+
+for k = 1:numel(M)
+    pidTok = regexp(M(k).name,'(chb\d+)_','tokens','once');
+    if isempty(pidTok), continue; end
+    pid = string(pidTok{1});
+    if ~ismember(pid, string(opt.Patients)), continue; end
+    fprintf("\n=== LOCAL PSEUDO GMM: %s ===\n", pid);
+
+    % ---------- Load data ----------
+    Smod = load(fullfile(M(k).folder,M(k).name)); % to locate rep/split
+    Srep = load(Smod.repFile,'X','Y');
+    Sspl = load(Smod.splFile);
+    [trainRows, testRows] = get_split_rows(Sspl, numel(Srep.Y));
+
+    Sm = load(fullfile(repDir,opt.FeatureMaskFile));
+    keepIdx = double(Sm.keepIdx(:));
+    D = numel(keepIdx);
+    assert(D==15,'Expected 15 features.');
+
+    X = double(Srep.X(:,keepIdx));
+    y = uint8(Srep.Y==2);   % 1=ictal, 0=non
+    Xtr_all = clean_nonfinite(X(trainRows,:)); ytr = y(trainRows);
+    Xte_all = clean_nonfinite(X(testRows ,:)); yte = y(testRows);
+
+    % Z-normalisation from TRAIN
+    mu = mean(Xtr_all,1); sg = std(Xtr_all,0,1); sg(sg<1e-6)=1e-6;
+    Xtr = (Xtr_all - mu)./sg; Xtr(~isfinite(Xtr))=0;
+    Xte = (Xte_all - mu)./sg; Xte(~isfinite(Xte))=0;
+
+    % ---------- Train baseline CNN ----------
+    layers = build_simple_layers(D);
+    optsTN = trainingOptions('adam','MaxEpochs',opt.MaxEpochs,...
+        'MiniBatchSize',opt.MiniBatchSize,...
+        'InitialLearnRate',opt.InitialLearnRate,...
+        'Shuffle','every-epoch','Verbose',false);
+
+    net_local = trainNetwork(reshape(single(Xtr.'),[1 D 1 size(Xtr,1)]), ...
+                             categorical(ytr,[0 1],{'non','ictal'}), ...
+                             layers, optsTN);
+
+    % ---------- Baseline evaluation ----------
+    [XA,yA,XB,yB] = build_test_sets(Xte,yte);
+    [mA_base,mB_base] = eval_cnn_probs(net_local,XA,yA,XB,yB,D);
+    fprintf("  Base TestA: AUC=%.3f AccI=%.3f AccN=%.3f | TestB: AUC=%.3f AccI=%.3f AccN=%.3f\n",...
+        mA_base.AUROC,mA_base.AccIctal,mA_base.AccNon,...
+        mB_base.AUROC,mB_base.AccIctal,mB_base.AccNon);
+
+    % ---------- Fit GMMs on TRAIN ----------
+    Xpos = Xtr_all(ytr==1,:); Xneg = Xtr_all(ytr==0,:);
+    if size(Xpos,1)<10 || size(Xneg,1)<10
+        warning("%s: too few samples — skipping.",pid); continue;
+    end
+
+    gmmPos = fitgmdist(Xpos,opt.GMMComponents,'CovarianceType','full','RegularizationValue',1e-5);
+    gmmNeg = fitgmdist(Xneg,opt.GMMComponents,'CovarianceType','full','RegularizationValue',1e-5);
+
+    % ---------- Generate balanced pseudo data ----------
+    N = opt.TargetPerClass;
+    Xp_pos = random(gmmPos,N);
+    Xp_neg = random(gmmNeg,N);
+
+    % clip to 1–99% quantile range of TRAIN
+    lo = quantile(Xtr_all,0.01,1); hi = quantile(Xtr_all,0.99,1);
+    Xp_pos = min(max(Xp_pos,lo),hi);
+    Xp_neg = min(max(Xp_neg,lo),hi);
+
+    Xp_all = [Xp_pos; Xp_neg];
+    yp_all = [ones(N,1,'uint8'); zeros(N,1,'uint8')];
+    fprintf("  Generated pseudo: pos=%d neg=%d\n",N,N);
+
+    % ---------- Train CNN on pseudo ----------
+    Xp_scaled = (Xp_all - mu)./sg; Xp_scaled(~isfinite(Xp_scaled))=0;
+    net_pseudo = trainNetwork(reshape(single(Xp_scaled.'),[1 D 1 size(Xp_scaled,1)]), ...
+        categorical(yp_all,[0 1],{'non','ictal'}), ...
+        layers, optsTN);
+
+    % ---------- Evaluate pseudo model ----------
+    [mA_pseudo,mB_pseudo] = eval_cnn_probs(net_pseudo,XA,yA,XB,yB,D);
+    fprintf("  Pseudo TestA: AUC=%.3f AccI=%.3f AccN=%.3f | TestB: AUC=%.3f AccI=%.3f AccN=%.3f\n",...
+        mA_pseudo.AUROC,mA_pseudo.AccIctal,mA_pseudo.AccNon,...
+        mB_pseudo.AUROC,mB_pseudo.AccIctal,mB_pseudo.AccNon);
+
+    % ---------- Save + append summary ----------
+    save(fullfile(outDir,pid+"_local_pseudo_gmm.mat"),...
+        'net_local','net_pseudo','mu','sg','keepIdx','gmmPos','gmmNeg',...
+        'mA_base','mB_base','mA_pseudo','mB_pseudo','Xp_pos','Xp_neg');
+
+    newRow = table(pid,...
+        mA_base.AUROC,mA_base.AccIctal,mA_base.AccNon,...
+        mB_base.AUROC,mB_base.AccIctal,mB_base.AccNon,...
+        mA_pseudo.AUROC,mA_pseudo.AccIctal,mA_pseudo.AccNon,...
+        mB_pseudo.AUROC,mB_pseudo.AccIctal,mB_pseudo.AccNon,...
+        'VariableNames',{'Patient',...
+        'BaseA_AUROC','BaseA_AccI','BaseA_AccN',...
+        'BaseB_AUROC','BaseB_AccI','BaseB_AccN',...
+        'PseudoA_AUROC','PseudoA_AccI','PseudoA_AccN',...
+        'PseudoB_AUROC','PseudoB_AccI','PseudoB_AccN'});
+    summaryT = [summaryT; newRow];
+
+    % ===== SAVE LOCAL PSEUDO DATA =====
+    pseudoDir = fullfile(repDir, 'models_cnn1d_binary', 'fed', 'pseudo_data', char(pid));
+    if ~isfolder(pseudoDir)
+        mkdir(pseudoDir);
+    end
+    
+    % Separate ictal/non-ictal pools
+    Xp_pos = Xp_all(yp_all==1,:);
+    Xp_neg = Xp_all(yp_all==0,:);
+    
+    save(fullfile(pseudoDir,'pseudo_pos.mat'),'Xp_pos','-v7.3');
+    save(fullfile(pseudoDir,'pseudo_neg.mat'),'Xp_neg','-v7.3');
+    
+    % Optionally store summary statistics
+    mu_local = mean(Xp_all,1);
+    sg_local = std(Xp_all,0,1);
+    save(fullfile(pseudoDir,'pseudo_stats.mat'),'mu_local','sg_local');
+    
+    fprintf('  [%s] Saved pseudo data → %s\n', pid, pseudoDir);
+
+end
+
+% Write summary CSV
+outCSV = fullfile(outDir,'local_pseudo_gmm_summary.csv');
+writetable(summaryT,outCSV);
+fprintf("\n✅ Summary written → %s\n", outCSV);
+disp(summaryT);
+end
+
+% ----------------- Helpers -----------------
+function [trainRows, testRows] = get_split_rows(Sspl, N)
+if isfield(Sspl,'trainRows'), trainRows = double(Sspl.trainRows(:));
+elseif isfield(Sspl,'trainMask'), trainRows = find(logical(Sspl.trainMask(:)));
+else, error('Split missing trainRows/trainMask.'); end
+if isfield(Sspl,'testRows'), testRows = double(Sspl.testRows(:));
+elseif isfield(Sspl,'testMask'), testRows = find(logical(Sspl.testMask(:)));
+else, mTe = true(N,1); mTe(trainRows)=false; testRows = find(mTe); end
+end
+
+function X = clean_nonfinite(X)
+bad = ~isfinite(X);
+if any(bad,'all')
+    mu = median(X,1,'omitnan'); mu(~isfinite(mu))=0;
+    for j=1:size(X,2)
+        bj=bad(:,j); if any(bj), X(bj,j)=mu(j); end
+    end
+    X(~isfinite(X))=0;
+end
+end
+
+function layers = build_simple_layers(D)
+layers = [
+    imageInputLayer([1 D 1],'Normalization','none')
+    convolution2dLayer([1 5],32,'Padding','same')
+    batchNormalizationLayer
+    reluLayer
+    dropoutLayer(0.2)
+    fullyConnectedLayer(64)
+    reluLayer
+    fullyConnectedLayer(2)
+    softmaxLayer
+    classificationLayer];
+end
+
+function [XA,yA,XB,yB] = build_test_sets(Xte,yte)
+isPos = (yte==1); isNeg = ~isPos;
+keepNeg = min(sum(isNeg), sum(isPos));
+negIdx = find(isNeg);
+if ~isempty(negIdx) && keepNeg>0
+    negKeep = negIdx(randsample(numel(negIdx), keepNeg));
+else
+    negKeep = [];
+end
+keepA = sort([find(isPos); negKeep(:)]);
+XA = Xte(keepA,:);  yA = yte(keepA);
+XB = Xte;           yB = yte;
+end
+
+function p = cnn_predict_prob(net, X, D)
+imgs = reshape(single(X.'),[1 D 1 size(X,1)]);
+P = predict(net, imgs);
+p = double(P(:,2)); p = max(0,min(1,p));
+end
+
+function [mA,mB] = eval_cnn_probs(net,XA,yA,XB,yB,D)
+pA = cnn_predict_prob(net,XA,D);
+pB = cnn_predict_prob(net,XB,D);
+mA = metrics_bin(yA,pA,0.5);
+mB = metrics_bin(yB,pB,0.5);
+end
+
+function m = metrics_bin(ytrue,p,thr)
+y = logical(ytrue(:)); p = p(:);
+try, [~,~,~,auroc] = perfcurve(y,p,true);
+catch, auroc = NaN; end
+yhat = p >= thr;
+tp = sum(yhat & y); fn = sum(~yhat & y);
+tn = sum(~yhat & ~y); fp = sum(yhat & ~y);
+accI = tp / max(tp+fn,1);
+accN = tn / max(tn+fp,1);
+m = struct('AUROC',auroc,'AccIctal',accI,'AccNon',accN);
+end
