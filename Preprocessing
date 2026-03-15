@@ -1,0 +1,387 @@
+function step02_harmonize_and_save_b()
+% STEP 02 — Harmonize EDFs to a fixed channel set, add seizure mask, save per patient
+% Version: v1.0.3  (2025-08-17)
+% This version locks in:
+%   - Header-driven channel identity (map by INDEX)
+%   - Robust edfread (handles 'Record Time' name bug; local warning suppression)
+%   - No double(duration) anywhere (durations/datetimes -> seconds -> double)
+%   - Per-signal Fs from header (fallbacks included)
+%   - NaN row fill for missing targets
+%   - Manifest times coerced to double seconds
+%
+% Inputs:
+%   modified_files/channel_catalog_headers.mat   (from step01c_build_channel_catalog_from_headers)
+%   modified_files/seizure_manifest.mat
+% Outputs:
+%   modified_files/chbXX_clean.mat (one per patient)
+%   modified_files/manifest.csv
+%   modified_files/_pipeline_versions.txt (append-only provenance)
+
+%% ================== CONFIG ==================
+rootDir   = "C:\Research project Backup 05072025\Research Project\MIT_Epilepsy_Data_V2\chb-mit-scalp-eeg-database-1.0.0";
+outDir    = fullfile(rootDir, "modified_files");
+FsTarget  = 256;     % Hz
+minPct    = 90;      % keep channels present in >= this % of records (from HEADERS)
+fillValue = NaN;     % NaN rows for missing channels
+maxPool   = 24;      % cap workers
+suppressEdfWarnings = true; % silence duplicate-label spam locally
+smokeTestPatient = "";      % e.g. "chb04" to limit run; "" = all
+%% ============================================
+
+versionTag = "step02_v1.0.3";
+assert(isfolder(outDir), "Output folder not found: %s", outDir);
+
+% --- load header-based channel set ---
+C = load(fullfile(outDir,"channel_catalog_headers.mat"), 'channelUsage');
+channelUsage = C.channelUsage;
+targetMask      = channelUsage.percentOfRecords >= minPct;
+channelsCanon   = string(channelUsage.canonKey(targetMask));     % A–Z0–9 keys
+channelsDisplay = string(channelUsage.displayName(targetMask));  % pretty labels
+assert(~isempty(channelsCanon), 'No channels meet the >= %d%% threshold.', minPct);
+
+% --- load manifest & coerce times to plain double seconds ---
+M = load(fullfile(outDir, "seizure_manifest.mat"), 'seizureManifest');
+seizureManifest = M.seizureManifest;
+nk = @(s) regexprep(lower(regexprep(string(s), '\.edf$','')), '[+\s]','');
+toSecs = @(x) (isduration(x).*seconds(x) + ~isduration(x).*double(x));
+if ~isempty(seizureManifest)
+    seizureManifest.recordKey = nk(seizureManifest.recordKey);
+    if ~isnumeric(seizureManifest.startSec), seizureManifest.startSec = toSecs(seizureManifest.startSec); end
+    if ~isnumeric(seizureManifest.endSec),   seizureManifest.endSec   = toSecs(seizureManifest.endSec);   end
+end
+
+% map: "patient|recordKey" -> Nx2 [start end] (seconds)
+intervalMap = containers.Map('KeyType','char','ValueType','any');
+if ~isempty(seizureManifest)
+    for i = 1:height(seizureManifest)
+        key = sprintf('%s|%s', seizureManifest.patientID(i), seizureManifest.recordKey(i));
+        row = [seizureManifest.startSec(i), seizureManifest.endSec(i)];
+        if isKey(intervalMap, key), intervalMap(key) = [intervalMap(key); row];
+        else,                       intervalMap(key) = row;
+        end
+    end
+end
+
+% --- parallel pool ---
+try
+    p = gcp('nocreate');
+    if isempty(p)
+        pc = parcluster('local');
+        N  = min([feature('numCores'), pc.NumWorkers, maxPool]);
+        parpool(pc, N);
+    end
+catch ME
+    warning("Parallel pool not started: %s. Continuing serially.", ME.message);
+end
+
+% --- iterate patients ---
+dPatients = dir(fullfile(rootDir, "chb*")); dPatients = dPatients([dPatients.isdir]);
+patients  = string({dPatients.name})';
+if strlength(smokeTestPatient) > 0
+    patients = patients(patients==string(smokeTestPatient));
+end
+
+manifest = table('Size',[0 8], 'VariableTypes', ...
+    {'string','string','string','double','double','double','double','double'}, ...
+    'VariableNames', {'patientID','recordName','filePath','Fs','durationSec','nSamples','nSeizureSamples','nTargetPresent'});
+
+fprintf("STEP02 %s using %d targets (>= %d%%): %s\n", versionTag, numel(channelsCanon), minPct, strjoin(channelsDisplay, ", "));
+
+for pidx = 1:numel(patients)
+    pid = patients(pidx);
+    edfList = dir(fullfile(rootDir, pid, "*.edf"));
+    if isempty(edfList)
+        warning("[%s] No EDFs.", pid); continue;
+    end
+
+    fprintf("\n[%s] Processing %d EDF files...\n", pid, numel(edfList));
+    recCell = cell(numel(edfList),1);
+
+    parfor i = 1:numel(edfList)
+        fpath   = string(fullfile(edfList(i).folder, edfList(i).name));
+        recName = string(regexprep(edfList(i).name, '\.edf$','', 'ignorecase'));
+        key     = sprintf('%s|%s', pid, nk(recName));
+        intervals = [];
+        if isKey(intervalMap, key), intervals = intervalMap(key); end
+        recCell{i} = processOneRecord(fpath, pid, recName, channelsCanon, FsTarget, fillValue, intervals, suppressEdfWarnings);
+    end
+
+    recCell = recCell(~cellfun(@isempty, recCell));
+    if isempty(recCell)
+        warning("[%s] No records processed successfully.", pid);
+        continue;
+    end
+
+    recs = [recCell{:}]; %#ok<NASGU>
+    manAdd = cell2table(cell(0,8), 'VariableNames', manifest.Properties.VariableNames);
+    for i = 1:numel(recCell)
+        r = recCell{i};
+        manAdd = [manAdd; {pid, r.recordName, r.filePath, r.Fs, r.durationSec, size(r.data,2), nnz(r.seizureMask), r.nTargetPresent}]; %#ok<AGROW>
+    end
+    manifest = [manifest; manAdd]; %#ok<AGROW>
+
+    channels = channelsDisplay; %#ok<NASGU>
+    save(fullfile(outDir, sprintf("%s_clean.mat", pid)), 'pid', 'channels', 'channelsDisplay', 'recs', '-v7.3');
+    fprintf("[%s] Saved %s\n", pid, fullfile(outDir, sprintf("%s_clean.mat", pid)));
+end
+
+writetable(manifest, fullfile(outDir, "manifest.csv"));
+append_version_stamp(outDir, versionTag, FsTarget, minPct, channelsDisplay);
+fprintf("\nDone. Outputs in %s\n", outDir);
+end
+
+%% ================= local functions =================
+function rec = processOneRecord(fpath, pid, recName, channelsCanon, FsTarget, fillValue, intervals, suppressEdfWarnings)
+% Map edfread columns to HEADER labels by index, harmonise to channelsCanon.
+
+    rec = [];
+    try
+        ei = edfinfo(fpath);
+
+        % Header labels & canonical keys (order matters!)
+        hdrLbls   = string(ei.SignalLabels);
+        hdrCanon  = canonKey(hdrLbls);
+        isAnnotKey = contains(hdrCanon,"ANNOT","IgnoreCase",true) | hdrCanon=="EDFANNOTATIONS" | hdrCanon=="RECORDTIME";
+
+        % Read data with robust wrapper (handles 'Record Time' bug)
+        TT = safe_edfread(fpath, suppressEdfWarnings);
+
+        % Variables regardless of table/timetable
+        assert(istimetable(TT) || istable(TT), 'Unexpected edfread output type: %s', class(TT));
+        varNames = string(TT.Properties.VariableNames);
+
+        % Build map by INDEX: k-th header label ↔ k-th column
+        K = min(numel(hdrCanon), numel(varNames));
+        rawMap = containers.Map('KeyType','char','ValueType','any');  % canon -> double column
+        for k = 1:K
+            key = hdrCanon(k);
+            if key=="" || isAnnotKey(k), continue; end
+            y = normalize_to_double(TT.(varNames(k)));  % numeric column
+            if isempty(y), continue; end
+            if ~isKey(rawMap, char(key))
+                rawMap(char(key)) = y;
+            else
+                if numel(y) > numel(rawMap(char(key))), rawMap(char(key)) = y; end
+            end
+        end
+
+        % Sampling rate: prefer per-signal header; fallback to TT estimate
+        FsPerSig = inferFsPerSignal(ei);
+        FsTT = [];
+        if isempty(FsPerSig) && istimetable(TT) && height(TT) >= 2
+            dt = seconds(TT.Time(2) - TT.Time(1));
+            if dt > 0, FsTT = 1/dt; end
+        end
+
+        % Duration from header (robust to duration class)
+        durationSecHdr = NaN;
+        if isprop(ei,'DataRecordDuration') && ~isempty(ei.DataRecordDuration) && isprop(ei,'NumDataRecords') && ~isempty(ei.NumDataRecords)
+            drdSec = to_seconds(ei.DataRecordDuration);
+            durationSecHdr = drdSec * double(ei.NumDataRecords);
+        elseif isprop(ei,'FileDuration') && ~isempty(ei.FileDuration)
+            durationSecHdr = to_seconds(ei.FileDuration);
+        end
+
+        % Resample present targets to FsTarget
+        C = numel(channelsCanon);
+        dataResamp = cell(C,1);
+        lens       = zeros(C,1);
+        nPresent   = 0;
+
+        for c = 1:C
+            key = channelsCanon(c);
+            if ~isKey(rawMap, char(key))
+                dataResamp{c} = []; lens(c) = 0; continue;
+            end
+            nPresent = nPresent + 1;
+
+            y = rawMap(char(key)); % double column
+
+            FsCh = [];
+            if ~isempty(FsPerSig)
+                j = find(hdrCanon == key, 1, 'first');
+                if ~isempty(j) && j <= numel(FsPerSig) && ~isnan(FsPerSig(j)) && FsPerSig(j) > 0
+                    FsCh = FsPerSig(j);
+                end
+            end
+            if isempty(FsCh)
+                if ~isempty(FsTT), FsCh = FsTT; else, FsCh = FsTarget; end
+            end
+
+            if abs(FsCh - FsTarget) < 1e-9
+                yr = y;
+            else
+                [p,q] = rat(FsTarget / FsCh, 1e-12);
+                yr = resample(y, p, q);
+            end
+            dataResamp{c} = yr(:);
+            lens(c) = numel(yr);
+        end
+
+        % Final length covers header duration, data, and seizure intervals
+        N_hdr  = ~isnan(durationSecHdr) * ceil(durationSecHdr * FsTarget);
+        N_dat  = max(lens);
+        N_seiz = 0; if ~isempty(intervals), N_seiz = 1 + floor(max(intervals(:,2))*FsTarget); end
+        N = max([N_hdr, N_dat, N_seiz, 0]);
+        if N==0
+            if istimetable(TT) && height(TT) >= 2
+                dur = seconds(TT.Time(end)-TT.Time(1));
+                if dur > 0, N = ceil(dur*FsTarget); end
+            end
+            if N==0
+                warning("[%s] %s length indeterminate; skipping.", pid, recName);
+                return;
+            end
+        end
+
+        % Assemble fixed-order matrix (NaN rows where channel missing)
+        data = ones(C, N) * fillValue;
+        for c = 1:C
+            n = lens(c);
+            if n > 0
+                if n >= N, data(c,:) = dataResamp{c}(1:N).';
+                else,      data(c,1:n) = dataResamp{c}(:).';
+                end
+            end
+        end
+
+        % Seizure mask at FsTarget
+        seizureMask = false(1,N);
+        if ~isempty(intervals)
+            for k = 1:size(intervals,1)
+                s = max(0, intervals(k,1));
+                e = max(s, intervals(k,2));
+                iS = 1 + floor(s*FsTarget);
+                iE = 1 + floor(e*FsTarget);
+                iS = max(1, min(N, iS));
+                iE = max(1, min(N, iE));
+                if iS <= iE, seizureMask(iS:iE) = true; end
+            end
+        end
+
+        % Start time (optional)
+        sdt = NaT;
+        if isprop(ei,'StartDateTime') && ~isempty(ei.StartDateTime), sdt = ei.StartDateTime;
+        elseif isprop(ei,'StartTime') && ~isempty(ei.StartTime),    sdt = ei.StartTime;
+        end
+        if ~isdatetime(sdt), sdt = NaT; end
+
+        % Pack record
+        rec.patientID     = pid;
+        rec.recordName    = recName;
+        rec.filePath      = string(fpath);
+        rec.startDateTime = sdt;
+        rec.Fs            = FsTarget;
+        rec.durationSec   = N / FsTarget;
+        rec.data          = data;          % rows == channelsDisplay order saved at file level
+        rec.seizureMask   = seizureMask;
+        rec.nTargetPresent= nPresent;
+
+    catch ME
+        warning("Failed record: %s\n  %s", fpath, ME.message);
+        rec = [];
+    end
+end
+
+function TT = safe_edfread(fpath, suppressWarnings)
+% Robust wrapper for edfread:
+%  - Silences duplicate-label warnings locally
+%  - Tries 'datetime' first; on "'Record Time' is invalid" / replacement errors,
+%    retries with 'samples' (no row-time name -> avoids the bug).
+    if nargin < 2, suppressWarnings = true; end
+    function TTloc = do_read(mode)
+        if suppressWarnings
+            ws = warning; c = onCleanup(@() warning(ws));
+            warning('off','signal:edfread:NonUniqueSignalLabels');
+            warning('off','signal:edfinfo:NonUniqueSignalLabels');
+            warning('off','MATLAB:table:ModifiedAndSavedVarnames');
+            TTloc = edfread(fpath, 'TimeOutputType', mode);
+        else
+            TTloc = edfread(fpath, 'TimeOutputType', mode);
+        end
+    end
+    try
+        TT = do_read('datetime');
+    catch ME
+        if contains(ME.message, 'Record Time', 'IgnoreCase', true) || ...
+           contains(ME.message, 'Replacement must use correct MATLAB syntax', 'IgnoreCase', true)
+            TT = do_read('samples');   % fallback
+        else
+            rethrow(ME);
+        end
+    end
+    if ~(istimetable(TT) || istable(TT))
+        error('safe_edfread:UnexpectedOutput', 'edfread returned a %s', class(TT));
+    end
+end
+
+function FsPerSig = inferFsPerSignal(ei)
+% Prefer per-signal rates from header; otherwise derive from NumSamples/DRD.
+    FsPerSig = [];
+    if isprop(ei,'SignalInfo') && istable(ei.SignalInfo) && any(strcmp('SampleRate', ei.SignalInfo.Properties.VariableNames))
+        FsPerSig = double(ei.SignalInfo.SampleRate(:))'; return;
+    end
+    if isprop(ei,'SampleRate') && ~isempty(ei.SampleRate)
+        FsPerSig = double(ei.SampleRate(:))'; return;
+    end
+    if isprop(ei,'NumSamples') && ~isempty(ei.NumSamples) && isprop(ei,'DataRecordDuration') && ~isempty(ei.DataRecordDuration)
+        drdSec = to_seconds(ei.DataRecordDuration);
+        FsPerSig = double(ei.NumSamples(:))' ./ drdSec;
+    end
+end
+
+function s = to_seconds(x)
+% Robust seconds conversion for header durations / scalars
+    if isduration(x), s = seconds(x);
+    else,             s = double(x);
+    end
+end
+
+function c = canonKey(s)
+% Uppercase, drop leading EEG, keep only A–Z and 0–9
+    c = upper(string(s));
+    c = regexprep(c, '^\s*EEG[:\s_+-]*', '', 'ignorecase');
+    c = regexprep(c, '[^A-Z0-9]', '');
+end
+
+function y = normalize_to_double(x)
+% ALWAYS return a DOUBLE column vector; supports numeric/duration/datetime/cell of those.
+    if isnumeric(x),  y = double(x(:)); return; end
+    if isduration(x), y = double(seconds(x(:))); return; end
+    if isdatetime(x), t0 = x(1); y = double(seconds(x - t0)); y = y(:); return; end
+    if iscell(x)
+        try
+            z = cell(size(x));
+            for i = 1:numel(x)
+                xi = x{i};
+                if isempty(xi)
+                    z{i} = [];
+                elseif isduration(xi)
+                    z{i} = double(seconds(xi(:)));
+                elseif isdatetime(xi)
+                    t0i = xi(1); z{i} = double(seconds(xi - t0i));
+                elseif isnumeric(xi) || islogical(xi)
+                    z{i} = double(xi(:));
+                else
+                    z{i} = [];
+                end
+            end
+            y = double(vertcat(z{:})); y = y(:); return;
+        catch
+            y = []; return;
+        end
+    end
+    y = [];
+end
+
+function append_version_stamp(outDir, versionTag, FsTarget, minPct, channelsDisplay)
+% Write/append a small provenance note so we don't lose track of versions.
+    try
+        fid = fopen(fullfile(outDir, "_pipeline_versions.txt"), 'a');
+        fprintf(fid, "[%s] %s | FsTarget=%g | minPct=%g | nTargets=%d\n", ...
+            datestr(now, 'yyyy-mm-dd HH:MM:SS'), versionTag, FsTarget, minPct, numel(channelsDisplay));
+        fclose(fid);
+    catch
+        % non-fatal
+    end
+end
