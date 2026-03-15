@@ -1,0 +1,321 @@
+function out = run_cnn_feature_select_boosted(rootDir, boostedSubdir, varargin)
+% CNN-Gated Feature Selection on Boosted Step-04 features (binary ictal vs non-ictal).
+% - Per-feature gates (FeatureGateLayer.m must be on path)
+% - Small MLP head
+% - Group sparsity on gates + correlation pruning
+% - Grouped 5-fold by patient; early stopping
+% - Saves keepIdx + metadata + AUC-vs-K curve
+
+% ---------- Options ----------
+p = inputParser;
+addParameter(p,'Kgrid',        [64 128 256]);
+addParameter(p,'rhoPrune',     0.90);
+addParameter(p,'epochs',       30);
+addParameter(p,'patience',     4);
+addParameter(p,'mb',           256);
+addParameter(p,'lr',           1e-3);
+addParameter(p,'lambdaL1',     5e-4);
+addParameter(p,'lambdaGrp',    2e-4);
+addParameter(p,'useGPU',       canUseGPU());
+addParameter(p,'saveDir',      boostedSubdir);
+parse(p, varargin{:});
+opt = p.Results;
+
+% ---------- Locate boosted files ----------
+boostDir = fullfile(rootDir, boostedSubdir);
+assert(isfolder(boostDir), 'Boosted folder not found: %s', boostDir);
+FF = dir(fullfile(boostDir, "chb*_setsvd_W4s_boosted.mat"));
+assert(~isempty(FF),'No boosted Step-04 files found in %s', boostDir);
+
+% ---------- Load & stack ----------
+Xcell = {}; Ycell = {}; Pcell = {}; Gcell = {}; Gnames = {}; Fnames = {};
+for i=1:numel(FF)
+    S = load(fullfile(FF(i).folder, FF(i).name), 'X','Y','meta','featGroups','groupNames','featNames');
+    Xcell{end+1} = single(S.X);
+    Ycell{end+1} = uint8(S.Y);
+    Pcell{end+1} = string(S.meta.patientID);
+    Gcell{end+1} = double(S.featGroups(:));
+    if isempty(Gnames), Gnames = S.groupNames; end
+    if isempty(Fnames), Fnames = S.featNames; end
+end
+X = vertcat(Xcell{:});
+Y = vertcat(Ycell{:});
+patientID = vertcat(Pcell{:});
+featGroups = Gcell{1};
+featNames  = Fnames;
+
+% Binary labels: 1=non-ictal, 2=ictal (like Step05)
+y = uint8(Y==2)+1;
+C = 2;
+[N,D] = size(X);
+fprintf('Loaded N=%d rows, D=%d features across %d patients.\n', N, D, numel(unique(patientID)));
+
+% ---------- Grouped 5-fold by patient ----------
+[folds, ~] = grouped_kfold(patientID, 5, 42);
+
+% ---------- Train per fold, collect |gates| ----------
+gateAbs_all = zeros(D, numel(folds), 'single');
+aucByFold   = zeros(numel(folds), 1);
+
+for f = 1:numel(folds)
+    trMask = folds(f).trainMask;
+    teMask = folds(f).testMask;
+
+    [Xtr, mu, sig] = zscore_train(X(trMask,:));
+    Xte = zscore_apply(X(teMask,:), mu, sig);
+    ytr = y(trMask); yte = y(teMask);
+
+    net = build_gated_mlp(D, C);
+    assert(net.Layers(1).InputSize == D, 'Net expects D=%d, got %d', net.Layers(1).InputSize, D);
+
+    [net, bestAUC] = train_gated_model(net, Xtr, ytr, Xte, yte, featGroups, opt);
+    aucByFold(f) = bestAUC;
+
+    gateAbs_all(:,f) = abs(extractdata(get_gate_alpha(net, "feature_gate")));
+    fprintf('Fold %d: best AUC=%.3f\n', f, bestAUC);
+end
+
+gateAgg = median(gateAbs_all, 2);   % robust across folds
+gateStats = table((1:D)', featNames(:), featGroups(:), double(gateAgg), ...
+    'VariableNames',{'featIdx','featName','featGroup','medianAbsGate'});
+
+% ---------- Evaluate K grid with redundancy pruning (per fold) ----------
+Kgrid = unique(opt.Kgrid(:))';
+aucK  = zeros(numel(Kgrid), numel(folds));
+for ki = 1:numel(Kgrid)
+    K = Kgrid(ki);
+    [~, ord] = sort(gateAgg, 'descend');
+    prelim = ord(1:min(K*4, D)); % buffer for pruning
+
+    for f=1:numel(folds)
+        trMask = folds(f).trainMask;
+        teMask = folds(f).testMask;
+
+        [Xtr, mu, sig] = zscore_train(X(trMask,:));
+        Xte = zscore_apply(X(teMask,:), mu, sig);
+        ytr = y(trMask); yte = y(teMask);
+
+        % --- inside the K-grid loop, per-fold evaluation ---
+
+% prune redundancy on TRAIN ONLY (Spearman)
+idxKeep = prune_redundancy_by_corr(Xtr, prelim, opt.rhoPrune, K);
+
+% Random Forest (Bagged Trees) with a template to set MinLeafSize
+t = templateTree('MinLeafSize', 3, 'Surrogate', 'off');
+mdl = fitcensemble( ...
+    double(Xtr(:, idxKeep)), categorical(ytr), ...
+    'Method', 'Bag', ...
+    'NumLearningCycles', 200, ...
+    'Learners', t, ...
+    'ClassNames', categorical([1 2]) );
+
+% Predict on held-out patients and compute AUC
+[~, score] = predict(mdl, double(Xte(:, idxKeep)));
+[~, ~, ~, AUC] = perfcurve((yte==2), score(:,2), true);
+aucK(ki, f) = AUC;
+
+    end
+    fprintf('K=%d | mean AUC=%.3f\n', K, mean(aucK(ki,:),'omitnan'));
+end
+
+aucMean = mean(aucK,2,'omitnan');
+[~,bestIdx] = max(aucMean);
+chosenK = Kgrid(bestIdx);
+
+% ---------- Final keepIdx (prune on all data after zscore) ----------
+[~, ord] = sort(gateAgg, 'descend');
+prelim = ord(1:min(chosenK*4, D));
+[Xz, mu_all, sig_all] = zscore_train(X); %#ok<ASGLU>
+Xz = zscore_apply(X, mu_all, sig_all);
+keepIdx = prune_redundancy_by_corr(Xz, prelim, opt.rhoPrune, chosenK);
+
+% ---------- Save outputs ----------
+saveDirAbs = fullfile(rootDir, opt.saveDir);
+if ~isfolder(saveDirAbs), mkdir(saveDirAbs); end
+saveFile = fullfile(saveDirAbs, "keepIdx_cnn_gated.mat");
+mask_meta = struct('created',datestr(now,'yyyy-mm-dd HH:MM:SS'), ...
+    'Kgrid',Kgrid, 'chosenK',chosenK, 'rhoPrune',opt.rhoPrune, ...
+    'epochs',opt.epochs,'patience',opt.patience,'mb',opt.mb,'lr',opt.lr, ...
+    'lambdaL1',opt.lambdaL1,'lambdaGrp',opt.lambdaGrp, ...
+    'notes','CNN-gated MLP with group sparsity; median|alpha| across 5 grouped folds.');
+keepIdx = keepIdx(:)'; %#ok<NASGU>
+save(saveFile, 'keepIdx', 'mask_meta');
+
+outTbl = table(Kgrid(:), aucMean, 'VariableNames',{'K','meanAUC'});
+
+out = struct;
+out.keepIdx   = keepIdx;
+out.K         = struct('grid',Kgrid,'chosen',chosenK);
+out.aucs      = outTbl;
+out.gateStats = gateStats;
+out.saveFile  = saveFile;
+
+fprintf('Saved keepIdx to %s (K=%d, pruned=%d)\n', saveFile, chosenK, numel(keepIdx));
+end
+
+% ================== Local helpers (functions only; no classdef) ==================
+
+function tf = canUseGPU()
+try, tf = parallel.gpu.GPUDevice.isAvailable; catch, tf = false; end
+end
+
+function [folds, pats] = grouped_kfold(patientID, K, seed)
+rng(seed);
+pats = unique(patientID);
+np = numel(pats);
+ord = randperm(np);
+folds = struct('trainMask',[],'testMask',[]);
+bins = round(linspace(0,np,K+1));
+for k=1:K
+    testPats = pats(ord(bins(k)+1:bins(k+1)));
+    testMask = ismember(patientID, testPats);
+    trainMask = ~testMask;
+    folds(k).trainMask = trainMask;
+    folds(k).testMask  = testMask;
+end
+end
+
+function [Xz, mu, sig] = zscore_train(X)
+mu = mean(X,1,'omitnan');
+sig = std(X,0,1,'omitnan'); sig(sig<1e-6)=1e-6;
+Xz = (X - mu) ./ sig;
+Xz(~isfinite(Xz)) = 0;
+end
+
+function Xz = zscore_apply(X, mu, sig)
+sig(sig<1e-6)=1e-6;
+Xz = (X - mu) ./ sig;
+Xz(~isfinite(Xz)) = 0;
+end
+
+function net = build_gated_mlp(D, C)
+layers = [
+    featureInputLayer(D, 'Name','in', 'Normalization','none')   % z-score done outside
+    FeatureGateLayer(D, "feature_gate")
+    fullyConnectedLayer(256, 'Name','fc1')
+    reluLayer('Name','relu1')
+    dropoutLayer(0.2,'Name','drop1')
+    fullyConnectedLayer(128,'Name','fc2')
+    reluLayer('Name','relu2')
+    fullyConnectedLayer(C,'Name','fc_out')
+    softmaxLayer('Name','softmax')];
+lgraph = layerGraph(layers);
+net = dlnetwork(lgraph);
+end
+
+function [net, bestAUC] = train_gated_model(net, Xtr, ytr, Xte, yte, featGroups, opt)
+mb = opt.mb; E = opt.epochs; lr=opt.lr;
+lambdaL1=opt.lambdaL1; lambdaGrp=opt.lambdaGrp;
+bestAUC = 0; bestNet = net; patience = opt.patience; wait=0;
+
+numIter = ceil(size(Xtr,1)/mb);
+avgGrad = []; avgSqGrad = [];
+
+% class weights (balance)
+cls = unique(ytr); cnt = zeros(1,numel(cls));
+for i=1:numel(cls), cnt(i) = sum(ytr==cls(i)); end
+w = 1./max(cnt,1); w = w/sum(w)*numel(cls);  % inverse frequency
+
+for ep = 1:E
+    idx = randperm(size(Xtr,1));
+    Xtr = Xtr(idx,:); ytr = ytr(idx);
+    for it = 1:numIter
+        s=(it-1)*mb+1; e=min(size(Xtr,1), it*mb);
+        % Inputs D×B (CB)
+        Xb = dlarray(single(Xtr(s:e,:))','CB');          % D×B
+
+        % Targets C×B (CB)
+        Tb = onehotencode(categorical(ytr(s:e)),2)';     % C×B numeric
+        Tb = dlarray(single(Tb),'CB');                   % dlarray C×B
+
+        [loss, grads] = dlfeval(@modelGradients, net, Xb, Tb, featGroups, lambdaL1, lambdaGrp, w);
+        [net, avgGrad, avgSqGrad] = adamupdate(net, grads, avgGrad, avgSqGrad, it + (ep-1)*numIter, lr);
+    end
+
+    AUC = eval_auc(net, Xte, yte);
+    if AUC > bestAUC + 1e-4
+        bestAUC = AUC; bestNet = net; wait=0;
+    else
+        wait = wait + 1;
+        if wait >= patience, break; end
+    end
+    fprintf('  ep %02d  valAUC=%.3f  (best=%.3f)\n', ep, AUC, bestAUC);
+end
+net = bestNet;
+end
+
+function [loss, grads] = modelGradients(net, Xb, Tb, featGroups, lambdaL1, lambdaGrp, classWeights)
+% Xb: D×B (CB), Tb: C×B (CB)
+Yb = forward(net, Xb);              % C×B
+Yb = clampProb(Yb);
+
+% Per-sample weights as C×B (numeric → dlarray)
+wB = class_weight_per_sample(extractdata(Tb), classWeights);  % numeric C×B
+wB = dlarray(single(wB), 'CB');
+
+% Cross-entropy (elementwise C×B → mean over batch)
+CE = -mean(sum(Tb .* log(Yb) .* wB, 1));
+
+% Gate regularisers
+alpha = get_gate_alpha(net, "feature_gate");   % D×1
+g = abs(alpha);
+L1 = sum(g,'all');
+
+Lgrp = 0;
+if ~isempty(featGroups)
+    ug = unique(featGroups(:))';
+    for k = ug
+        idx = find(featGroups==k);
+        Lgrp = Lgrp + sqrt(sum(g(idx).^2) + 1e-8);
+    end
+end
+
+loss = CE + lambdaL1*L1 + lambdaGrp*Lgrp;
+grads = dlgradient(loss, net.Learnables);
+end
+
+function P = clampProb(P), P = min(max(P,1e-7),1-1e-7); end
+
+function w = class_weight_per_sample(Tb, classWeights)
+% Tb: C×B onehot (numeric)
+C = size(Tb,1); B = size(Tb,2);
+w = zeros(1,B);
+for b=1:B
+    c = find(Tb(:,b)>0.5,1);
+    if isempty(c), w(b)=1; else, w(b)=classWeights(c); end
+end
+w = ones(C,1) * w;  % -> C×B
+end
+
+function AUC = eval_auc(net, X, y)
+if isempty(X), AUC = 0.5; return; end
+Xb = dlarray(single(X)','CB');      % D×N
+P = extractdata(forward(net, Xb));  % C×N
+score = P(2,:)'; labels = (y==2);
+[~,~,~,AUC] = perfcurve(labels, score, 1);
+end
+
+function a = get_gate_alpha(net, gateName)
+tbl = net.Learnables;
+row = find(tbl.Layer==gateName & tbl.Parameter=="Alpha", 1);
+a = tbl.Value{row};
+end
+
+function keep = prune_redundancy_by_corr(Xtr, prelim, rho, Ktarget)
+% Greedy keep-one per correlated cluster using Spearman
+Xs = Xtr(:, prelim);
+C = corr(Xs, 'Type','Spearman','Rows','pairwise');
+C(1:size(C,1)+1:end) = 0;
+score = var(Xs,0,1)';           
+picked = false(numel(prelim),1);
+keepIdx = [];
+while numel(keepIdx) < Ktarget
+    if all(picked), break; end
+    [~, j] = max(score .* (~picked));
+    picked(j) = true;
+    keepIdx(end+1) = j; %#ok<AGROW>
+    neigh = find(abs(C(j,:)) >= rho);
+    picked(neigh) = true;
+end
+keep = prelim(keepIdx);
+end
